@@ -51,13 +51,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v7
         with:
           go-version: "1.26"
       - name: Build binaries
-        uses: goreleaser/goreleaser-action@v6
+        uses: goreleaser/goreleaser-action@v7
         with:
           version: "~> v2"
           args: build --snapshot --clean
@@ -73,7 +73,7 @@ jobs:
           cp dist/*_windows_amd64*/obot-sentry.exe bin/
           cp dist/*_darwin_all/obot-sentry bin/
       - name: Upload binaries
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: binaries
           path: bin/*
@@ -88,9 +88,9 @@ jobs:
     runs-on: windows-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
       - name: Download binaries
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: binaries
           path: bin
@@ -109,7 +109,7 @@ jobs:
           ./build/windows/msi.ps1 -Version $env:VERSION -Exe bin/obot-sentry.exe
           ./build/windows/intune/intunewin.ps1
       - name: Upload installers
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: installers-windows
           path: |
@@ -124,21 +124,21 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
       - name: Download binaries
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: binaries
           path: dist
       - name: Download installers
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: installers-windows
           path: dist
       - name: Assemble MDM assets
         run: ./build/mdm-assets.sh "${VERSION}"
       - name: Upload MDM assets
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: mdm-assets
           path: dist/mdm-assets

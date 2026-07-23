@@ -1,8 +1,8 @@
 name: release
 
 # On a release tag: run the full build.yaml pipeline with the tag
-# version, then create a GitHub release carrying the installers, the
-# assets tarball, and a cosign-signed checksums file.
+# version, then create a GitHub release carrying the assets tarball
+# (which contains the installers) and its checksum.
 # Prerelease tags (v1.2.3-rc1) are skipped entirely: MSI ProductVersion
 # must be numeric x.y.z and obot-sentry only ships via the MDM installers.
 
@@ -12,7 +12,6 @@ on:
       - "v*"
 
 permissions:
-  id-token: write
   contents: write
 
 jobs:
@@ -31,6 +30,10 @@ jobs:
     uses: ./.github/workflows/build.yaml
     permissions:
       contents: read
+    # Reusable workflows don't see the caller's secrets unless told to;
+    # without this the QUILL_* signing secrets are empty and the release
+    # binary ships with only the Go linker's ad-hoc signature.
+    secrets: inherit
     with:
       version: ${{ needs.version.outputs.version }}
 
@@ -40,37 +43,20 @@ jobs:
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
-      - name: Download installers
-        uses: actions/download-artifact@v4
-        with:
-          name: installers-windows
-          path: dist
       - name: Download MDM assets
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: mdm-assets
           path: dist/mdm-assets
 
-      - name: Install Cosign
-        uses: sigstore/cosign-installer@v3.8.1
-        with:
-          cosign-release: "v2.4.3"
-
-      # Checksums over every release asset, signed keyless with the
-      # workflow's OIDC identity; verify with
-      #   cosign verify-blob --bundle checksums.txt.sigstore.json checksums.txt
-      - name: Checksum and sign release assets
+      - name: Checksum the assets tarball
         run: |
           tar -czf dist/mdm-assets.tar.gz -C dist/mdm-assets .
-          (cd dist && sha256sum obot-sentry.msi obot-sentry.intunewin mdm-assets.tar.gz > checksums.txt)
-          cosign sign-blob --yes --bundle dist/checksums.txt.sigstore.json dist/checksums.txt
+          (cd dist && sha256sum mdm-assets.tar.gz > checksums.txt)
 
       - name: Create release and upload assets
         run: |
           gh release create "${GITHUB_REF_NAME}" -R "${GITHUB_REPOSITORY}" \
             --title "${GITHUB_REF_NAME}" --generate-notes \
-            dist/obot-sentry.msi \
-            dist/obot-sentry.intunewin \
             dist/mdm-assets.tar.gz \
-            dist/checksums.txt \
-            dist/checksums.txt.sigstore.json
+            dist/checksums.txt
