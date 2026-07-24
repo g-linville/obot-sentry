@@ -44,13 +44,16 @@ hook maintenance the MSI sets up.
    Copy-Item obot-sentry.exe "C:\Program Files\Obot\obot-sentry\obot-sentry.exe"
    ```
 
-2. Configure Obot Sentry, replacing `REPLACE_WITH_ENROLLMENT_KEY` with your
-   enrollment key:
+2. Configure Obot Sentry by writing the same registry values the MSI
+   sets, replacing `REPLACE_WITH_ENROLLMENT_KEY` with your enrollment
+   key:
 
    ```powershell
-   $env:OBOT_SENTRY_SERVER_URL = "{{.serverURL}}"
-   $env:OBOT_SENTRY_ENROLLMENT_KEY = "REPLACE_WITH_ENROLLMENT_KEY"
-   $env:OBOT_SENTRY_SCAN_INTERVAL_MINUTES = "{{.scanIntervalMinutes}}"
+   $key = 'HKLM:\SOFTWARE\Obot\obot-sentry'
+   New-Item -Path $key -Force | Out-Null
+   Set-ItemProperty -Path $key -Name ServerURL -Value "{{.serverURL}}"
+   Set-ItemProperty -Path $key -Name EnrollmentKey -Value "REPLACE_WITH_ENROLLMENT_KEY"
+   Set-ItemProperty -Path $key -Name ScanIntervalMinutes -Value "{{.scanIntervalMinutes}}"
    ```
 
 ### Run a scan
@@ -59,8 +62,22 @@ hook maintenance the MSI sets up.
 & "C:\Program Files\Obot\obot-sentry\obot-sentry.exe" scan --submit
 ```
 
+By default, scans are submitted at most once every {{.scanIntervalMinutes}} minutes; runs within that window skip submission.
+
 ### Install hooks
 
 ```powershell
 & "C:\Program Files\Obot\obot-sentry\obot-sentry.exe" hook-install
+```
+
+### Uninstall
+
+Remove the binary, the configuration, and the device identity and scan
+state:
+
+```powershell
+Remove-Item -Recurse -Force "C:\Program Files\Obot\obot-sentry" -ErrorAction SilentlyContinue
+Remove-Item -Recurse -Force "HKLM:\SOFTWARE\Obot\obot-sentry" -ErrorAction SilentlyContinue
+Remove-Item -Recurse -Force "$env:ProgramData\obot\obot-sentry" -ErrorAction SilentlyContinue
+Remove-Item -Recurse -Force "$env:LOCALAPPDATA\obot\obot-sentry" -ErrorAction SilentlyContinue
 ```

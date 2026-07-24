@@ -9,13 +9,14 @@ yourself.
    sudo install -m 755 obot-sentry /usr/local/bin/obot-sentry
    ```
 
-2. Configure Obot Sentry, replacing `REPLACE_WITH_ENROLLMENT_KEY` with your
+2. Configure Obot Sentry by writing the same preferences domain an MDM
+   profile delivers, replacing `REPLACE_WITH_ENROLLMENT_KEY` with your
    enrollment key:
 
    ```sh
-   export OBOT_SENTRY_SERVER_URL="{{.serverURL}}"
-   export OBOT_SENTRY_ENROLLMENT_KEY="REPLACE_WITH_ENROLLMENT_KEY"
-   export OBOT_SENTRY_SCAN_INTERVAL_MINUTES="{{.scanIntervalMinutes}}"
+   sudo defaults write /Library/Preferences/com.obot.obot-sentry ServerURL -string "{{.serverURL}}"
+   sudo defaults write /Library/Preferences/com.obot.obot-sentry EnrollmentKey -string "REPLACE_WITH_ENROLLMENT_KEY"
+   sudo defaults write /Library/Preferences/com.obot.obot-sentry ScanIntervalMinutes -string "{{.scanIntervalMinutes}}"
    ```
 
 ## Run a scan
@@ -23,6 +24,8 @@ yourself.
 ```sh
 obot-sentry scan --submit
 ```
+
+By default, scans are submitted at most once every {{.scanIntervalMinutes}} minutes; runs within that window skip submission.
 
 ## Install hooks
 
@@ -32,6 +35,12 @@ sudo obot-sentry hook-install
 
 ## Uninstall
 
+Remove the binary, the configuration, and the device identity and scan
+state:
+
 ```sh
 sudo rm -f /usr/local/bin/obot-sentry
+sudo defaults delete /Library/Preferences/com.obot.obot-sentry
+sudo rm -rf "/Library/Application Support/obot/obot-sentry"
+rm -rf "$HOME/Library/Application Support/obot/obot-sentry" "$HOME/Library/Caches/obot/obot-sentry"
 ```
