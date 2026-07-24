@@ -19,6 +19,15 @@ yourself.
    sudo defaults write /Library/Preferences/com.obot.obot-sentry ScanIntervalMinutes -string "{{.scanIntervalMinutes}}"
    ```
 
+3. Enroll the device:
+
+   ```sh
+   sudo obot-sentry enroll
+   ```
+
+   Note: the device must be enrolled before submitting scans or
+   installing hooks.
+
 ## Run a scan
 
 ```sh

@@ -48,9 +48,8 @@ hook maintenance the MSI sets up.
    Copy-Item obot-sentry.exe "C:\Program Files\Obot\obot-sentry\obot-sentry.exe"
    ```
 
-2. Configure Obot Sentry by writing the same registry values the MSI
-   sets, replacing `REPLACE_WITH_ENROLLMENT_KEY` with your enrollment
-   key:
+2. Configure Obot Sentry, replacing `REPLACE_WITH_ENROLLMENT_KEY` with your
+   enrollment key:
 
    ```powershell
    $key = 'HKLM:\SOFTWARE\Obot\obot-sentry'
@@ -59,6 +58,15 @@ hook maintenance the MSI sets up.
    Set-ItemProperty -Path $key -Name EnrollmentKey -Value "REPLACE_WITH_ENROLLMENT_KEY"
    Set-ItemProperty -Path $key -Name ScanIntervalMinutes -Value "{{.scanIntervalMinutes}}"
    ```
+
+3. Enroll the device:
+
+   ```powershell
+   & "C:\Program Files\Obot\obot-sentry\obot-sentry.exe" enroll
+   ```
+
+   Enroll verifies the configuration and prints the device ID this
+   machine reports as.
 
 ### Run a scan
 
