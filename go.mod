@@ -1,6 +1,6 @@
 module github.com/obot-platform/obot-sentry
 
-go 1.26.4
+go 1.26.5
 
 require (
 	github.com/BurntSushi/toml v1.6.0
@@ -8,7 +8,7 @@ require (
 	github.com/golang-jwt/jwt/v5 v5.3.1
 	github.com/google/uuid v1.6.0
 	github.com/obot-platform/cmd v0.0.0-20260615195405-fab7a186f46c
-	github.com/obot-platform/obot/apiclient v0.0.0-20260716212309-520c3a04a943
+	github.com/obot-platform/obot/apiclient v0.0.0-20260729232143-e2a9e164d07f
 	github.com/spf13/cobra v1.10.2
 	github.com/tailscale/hujson v0.0.0-20260302212456-ecc657c15afd
 	golang.org/x/sys v0.46.0
