@@ -63,7 +63,9 @@ Turning enforcement off in Obot stops the blocking immediately — the server
 allows every call when enforcement is disabled — even before the hooks
 themselves are removed.
 {{end}}
-## Remove the hooks
+## Uninstall
+
+### 1. Remove the hooks
 
 `hook-install` has no uninstall command, so its hook configuration must be
 removed by hand. Every entry it writes is marked with `--managed-by
@@ -105,10 +107,9 @@ The per-user files (`~/.claude`, `~/.copilot`, VS Code settings) exist once per
 signed-in user, so repeat for each user on a shared Mac. Restart Claude Code,
 Codex, VS Code, and Cursor afterward to drop the hooks.
 
-## Uninstall
+### 2. Remove the binary and configuration
 
-Remove the hooks (above), then remove the binary, the configuration, and the
-device identity and scan state:
+Remove the binary, the configuration, and the device identity and scan state:
 
 ```sh
 sudo rm -f /usr/local/bin/obot-sentry

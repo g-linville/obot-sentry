@@ -31,16 +31,6 @@ To run a scan immediately after install, run the following command:
 Start-ScheduledTask -TaskName 'Obot Sentry Scan'
 ```
 
-### Uninstall
-
-```powershell
-msiexec /x "obot-sentry.msi" /qn
-```
-
-This unregisters the scheduled tasks but leaves the hook configuration the
-tasks already wrote into each user's agent files. Remove it with the steps in
-[Remove the hooks](#remove-the-hooks) below.
-
 ## Standalone binary (Alternate)
 
 Manually install `obot-sentry.exe` to run one-off scans or install hooks
@@ -89,18 +79,6 @@ By default, scans are submitted at most once every {{.scanIntervalMinutes}} minu
 & "C:\Program Files\Obot\obot-sentry\obot-sentry.exe" hook-install{{if .enforcementEnabled}} --enforce{{end}}
 ```
 
-### Uninstall
-
-Remove the hooks (see [Remove the hooks](#remove-the-hooks) below), then remove
-the binary, the configuration, and the device identity and scan state:
-
-```powershell
-Remove-Item -Recurse -Force "C:\Program Files\Obot\obot-sentry" -ErrorAction SilentlyContinue
-Remove-Item -Recurse -Force "HKLM:\SOFTWARE\Obot\obot-sentry" -ErrorAction SilentlyContinue
-Remove-Item -Recurse -Force "$env:ProgramData\obot\obot-sentry" -ErrorAction SilentlyContinue
-Remove-Item -Recurse -Force "$env:LOCALAPPDATA\obot\obot-sentry" -ErrorAction SilentlyContinue
-```
-
 {{if .enforcementEnabled}}## Tool-call enforcement
 
 Each tool call in Claude Code, Codex, and Cursor is checked against Obot's
@@ -125,12 +103,16 @@ value and let the hook task reconverge:
 Set-ItemProperty -Path 'HKLM:\SOFTWARE\Obot\obot-sentry' -Name EnforcementEnabled -Type DWord -Value 0
 ```
 
-{{end}}## Remove the hooks
+{{end}}## Uninstall
+
+Uninstall in this order: remove the hooks first, then Obot Sentry itself.
+Nothing in step 2 touches the hook configuration.
+
+### 1. Remove the hooks
 
 `hook-install` has no uninstall command, so its hook configuration must be
-removed by hand — the MSI uninstall and the cleanup above do not touch it.
-Every entry it writes is marked with `--managed-by obot-sentry`. Find the files
-that still carry one:
+removed by hand. Every entry it writes is marked with `--managed-by
+obot-sentry`. Find the files that still carry one:
 
 ```powershell
 Get-ChildItem -Recurse -File -ErrorAction SilentlyContinue `
@@ -170,3 +152,22 @@ Then clean up each agent:
 The per-user files (`.claude`, `.copilot`, VS Code settings) exist once per
 signed-in user, so repeat for each user on a shared machine. Restart Claude
 Code, Codex, VS Code, and Cursor afterward to drop the hooks.
+
+### 2. Remove Obot Sentry
+
+If you installed the MSI, uninstall it — this also unregisters the scheduled
+tasks, so no further scans or hook convergence happen:
+
+```powershell
+msiexec /x "obot-sentry.msi" /qn
+```
+
+If you installed the standalone binary, remove the binary, the configuration,
+and the device identity and scan state:
+
+```powershell
+Remove-Item -Recurse -Force "C:\Program Files\Obot\obot-sentry" -ErrorAction SilentlyContinue
+Remove-Item -Recurse -Force "HKLM:\SOFTWARE\Obot\obot-sentry" -ErrorAction SilentlyContinue
+Remove-Item -Recurse -Force "$env:ProgramData\obot\obot-sentry" -ErrorAction SilentlyContinue
+Remove-Item -Recurse -Force "$env:LOCALAPPDATA\obot\obot-sentry" -ErrorAction SilentlyContinue
+```

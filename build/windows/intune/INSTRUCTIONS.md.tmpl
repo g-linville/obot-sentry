@@ -36,8 +36,8 @@ editing the install command.
 
    This removes the agent and its scheduled tasks, so no further hook
    convergence happens, but it does not remove the hook configuration the
-   tasks already wrote into users' agent files. See
-   [Removing the audit hooks](#removing-the-audit-hooks) below.
+   tasks already wrote into users' agent files. When you uninstall from a
+   device, remove the hooks first — see **Uninstall** below.
 
 4. **Install behavior:** System. **Detection rule:** keep the MSI product
    code rule Intune fills in automatically from the package.
@@ -85,7 +85,11 @@ hook cannot tell which MCP server a call targets, the call is blocked.
 Upgrades re-run the same install command, so assignments configured with
 supersedence carry the configuration forward automatically.
 
-## Removing the audit hooks
+## Uninstall
+
+Uninstall in this order: remove the hooks first, then the agent.
+
+### 1. Remove the hooks
 
 `hook-install` has no uninstall command, so uninstalling the MSI stops future
 convergence but leaves the hooks already written into each user's agent
@@ -109,3 +113,18 @@ managed files (`%USERPROFILE%` and `%APPDATA%` resolve per user) are:
 Restart the agents afterward to drop the hooks. The standalone-binary
 `INSTRUCTIONS.md` in the manual configuration includes ready-to-run PowerShell
 for locating and deleting these entries.
+
+### 2. Remove the agent
+
+Uninstall the app from the device with Intune — either an uninstall assignment
+or removing the device from the app's assignments — which runs the uninstall
+command from step 3 above:
+
+```
+msiexec /x "obot-sentry.msi" /qn
+```
+
+That removes `obot-sentry.exe`, its registry configuration, and both scheduled
+tasks. The per-device state under `%ProgramData%\obot\obot-sentry` and
+`%LOCALAPPDATA%\obot\obot-sentry` is left behind; delete it with a remediation
+script if you want the device identity and scan state gone too.
