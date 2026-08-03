@@ -3,6 +3,7 @@ package enforce
 import (
 	"context"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -110,12 +111,26 @@ func TestEnvPathFallsBackToTheConventionalLocation(t *testing.T) {
 	}
 }
 
+// TestMachinePathIsAbsoluteInProduction covers a production Env, whose
+// MachineRoot is empty: a fixed machine path is handed back as the host spells
+// it, with no fixture root prepended.
 func TestMachinePathIsAbsoluteInProduction(t *testing.T) {
 	env := Env{Home: "/Users/dev", GOOS: "darwin"}
-	if got := env.machinePath(claudeManagedMCPDarwin); got != claudeManagedMCPDarwin {
-		t.Fatalf("machinePath = %q, want %q", got, claudeManagedMCPDarwin)
+	for _, abs := range []string{claudeManagedMCPDarwin, "/etc/codex/managed_config.toml"} {
+		if got, want := env.machinePath(abs), filepath.FromSlash(abs); got != want {
+			t.Errorf("machinePath(%q) = %q, want %q with nothing prepended", abs, got, want)
+		}
 	}
-	if got := env.machinePath("/etc/codex/managed_config.toml"); got != "/etc/codex/managed_config.toml" {
-		t.Fatalf("machinePath = %q", got)
+
+	// Since nothing is prepended, what comes back is absolute wherever the path
+	// given belongs. Those above are the macOS locations, which are absolute on
+	// macOS; on Windows the equivalent is the drive-letter fallback %PROGRAMFILES%
+	// stands in for.
+	native, nativeEnv := claudeManagedMCPDarwin, env
+	if runtime.GOOS == "windows" {
+		native, nativeEnv.GOOS = windowsProgramFilesDefault, "windows"
+	}
+	if got := nativeEnv.machinePath(native); !filepath.IsAbs(got) {
+		t.Errorf("machinePath(%q) = %q, want an absolute path", native, got)
 	}
 }

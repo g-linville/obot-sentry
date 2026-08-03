@@ -47,6 +47,18 @@ type errorWriter struct{ err error }
 
 func (w errorWriter) Write([]byte) (int, error) { return 0, w.err }
 
+// hookPayload renders a pre-tool hook payload naming tool and cwd. The cwd is
+// encoded rather than interpolated into the JSON: a Windows path is full of
+// backslashes, and a backslash opens an escape inside a JSON string.
+func hookPayload(t *testing.T, tool, cwd string) string {
+	t.Helper()
+	data, err := json.Marshal(map[string]string{"tool_name": tool, "cwd": cwd})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(data)
+}
+
 func writeTempFile(t *testing.T, content string) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "payload.json")
@@ -81,7 +93,7 @@ func TestEnforcePrintNormalizedDryRun(t *testing.T) {
 	writeFixtureFile(t, filepath.Join(home, ".claude.json"), `{"mcpServers":{
 		"linear": {"command": "npx", "args": ["-y", "linear-mcp@1.2.3"]}
 	}}`)
-	input := writeTempFile(t, `{"tool_name":"mcp__linear__search_issues","cwd":"`+home+`"}`)
+	input := writeTempFile(t, hookPayload(t, "mcp__linear__search_issues", home))
 
 	stdout, stderr, err := runCommand(t, enforceRoot(t, mdmconfig.Config{}),
 		"enforce", "--agent", "claude-code", "--event", "PreToolUse",
@@ -110,7 +122,7 @@ func TestEnforcePrintNormalizedDryRun(t *testing.T) {
 
 func TestEnforceDeniesWithNoServerConfigured(t *testing.T) {
 	home := homeFixture(t)
-	input := writeTempFile(t, `{"tool_name":"Bash","cwd":"`+home+`"}`)
+	input := writeTempFile(t, hookPayload(t, "Bash", home))
 
 	stdout, stderr, err := runCommand(t, enforceRoot(t, mdmconfig.Config{}),
 		"enforce", "--agent", "claude-code", "--event", "PreToolUse", "--input", input)
@@ -200,7 +212,7 @@ func TestEnforceUnparseableInvocationExitsBlocking(t *testing.T) {
 
 func TestEnforceManagedByMarker(t *testing.T) {
 	home := homeFixture(t)
-	input := writeTempFile(t, `{"tool_name":"Bash","cwd":"`+home+`"}`)
+	input := writeTempFile(t, hookPayload(t, "Bash", home))
 
 	if _, _, err := runCommand(t, enforceRoot(t, mdmconfig.Config{}),
 		"enforce", "--agent", "claude-code", "--event", "PreToolUse",
@@ -217,7 +229,7 @@ func TestEnforceManagedByMarker(t *testing.T) {
 
 func TestEnforceServerURLIgnoresEnvironment(t *testing.T) {
 	home := homeFixture(t)
-	input := writeTempFile(t, `{"tool_name":"Bash","cwd":"`+home+`"}`)
+	input := writeTempFile(t, hookPayload(t, "Bash", home))
 	t.Setenv("OBOT_SENTRY_SERVER_URL", "https://attacker.invalid")
 	t.Setenv("ENFORCE_SERVER_URL", "https://also-attacker.invalid")
 
@@ -263,7 +275,7 @@ func TestEnforceExplicitServerURLOverridesMDM(t *testing.T) {
 
 func TestEnforceResponseWriteFailureExitsBlocking(t *testing.T) {
 	home := homeFixture(t)
-	input := writeTempFile(t, `{"tool_name":"Bash","cwd":"`+home+`"}`)
+	input := writeTempFile(t, hookPayload(t, "Bash", home))
 	wantErr := errors.New("hook stdout is closed")
 	root := enforceRoot(t, mdmconfig.Config{})
 	root.SetOut(errorWriter{err: wantErr})

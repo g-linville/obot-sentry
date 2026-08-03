@@ -290,15 +290,22 @@ func TestRelWithinRejectsEscape(t *testing.T) {
 }
 
 func TestRootForMachineUsesVolumeRoot(t *testing.T) {
-	rootDir, rel, err := rootFor(ScopeMachine, "", filepath.FromSlash("/etc/codex/requirements.toml"))
+	// The path has to be one this host would install to: Windows requires a local
+	// drive-letter volume, which the /etc location Codex uses on macOS has none of.
+	abs := filepath.FromSlash("/etc/codex/requirements.toml")
+	if runtime.GOOS == "windows" {
+		abs = filepath.Join(windowsProgramData(), "OpenAI", "Codex", "requirements.toml")
+	}
+
+	rootDir, rel, err := rootFor(ScopeMachine, "", abs)
 	if err != nil {
 		t.Fatal(err)
 	}
-	wantRoot := filepath.VolumeName(filepath.FromSlash("/etc/codex/requirements.toml")) + string(filepath.Separator)
+	wantRoot := filepath.VolumeName(abs) + string(filepath.Separator)
 	if rootDir != wantRoot {
 		t.Fatalf("machine root = %q, want %q", rootDir, wantRoot)
 	}
-	if filepath.Join(rootDir, rel) != filepath.Clean(filepath.FromSlash("/etc/codex/requirements.toml")) {
-		t.Fatalf("root+rel = %q", filepath.Join(rootDir, rel))
+	if filepath.Join(rootDir, rel) != filepath.Clean(abs) {
+		t.Fatalf("root+rel = %q, want %q", filepath.Join(rootDir, rel), filepath.Clean(abs))
 	}
 }

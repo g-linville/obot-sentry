@@ -47,6 +47,18 @@ func newFixture(t *testing.T, goos string) *fixture {
 	return f
 }
 
+// hostRoot is the root a path on this host has to start with to be absolute:
+// "/" on Unix, and the working volume's root ("C:\") on Windows, where a rooted
+// path carrying no volume is not absolute at all.
+func hostRoot(t *testing.T) string {
+	t.Helper()
+	wd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return filepath.VolumeName(wd) + string(filepath.Separator)
+}
+
 // setenv sets a variable the fixture's Env resolves.
 func (f *fixture) setenv(key, value string) {
 	f.env[key] = value
