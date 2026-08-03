@@ -16,6 +16,9 @@ func validateHomeDir(home string) error {
 	if home == "" {
 		return fmt.Errorf("resolved console user has no home directory")
 	}
+	if err := validateInstallHomePath(home); err != nil {
+		return err
+	}
 	info, err := os.Lstat(home)
 	if err != nil {
 		return fmt.Errorf("resolved home %q is not accessible: %w", home, err)

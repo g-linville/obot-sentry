@@ -69,6 +69,9 @@ func rootFor(scope Scope, home, absPath string) (rootDir, rel string, err error)
 		}
 		return home, rel, nil
 	case ScopeMachine:
+		if err := validateInstallMachinePath(absPath); err != nil {
+			return "", "", err
+		}
 		rootDir := filepath.VolumeName(absPath) + string(filepath.Separator)
 		rel, err := relWithin(rootDir, absPath)
 		if err != nil {
