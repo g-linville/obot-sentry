@@ -531,8 +531,8 @@ func TestRunKeepsWarningsOffTheProtocolChannel(t *testing.T) {
 	if !json.Valid([]byte(run.stdout)) {
 		t.Fatalf("stdout is not valid JSON: %q", run.stdout)
 	}
-	if !strings.Contains(run.stderr, "connection refused") {
-		t.Errorf("stderr = %q, want the blocking reason", run.stderr)
+	if run.stderr != "obot-sentry enforce: blocked\n" {
+		t.Errorf("stderr = %q, want only the static block notice", run.stderr)
 	}
 }
 
@@ -556,32 +556,75 @@ func TestRunRefusesAnOversizedPayload(t *testing.T) {
 	}
 }
 
-// Neither channel may carry an unbounded server error. A non-2xx surfaces the
-// whole response body — half a megabyte of HTML through a reverse proxy — and
-// stderr is not a safe place for it either: Claude Code surfaces hook stderr into
-// the transcript.
-func TestRunBoundsAnUnboundedServerError(t *testing.T) {
+func TestRunDoesNotExposeServerError(t *testing.T) {
 	env := normalizeFixture(t)
+	const secret = "token-secret-404"
 	run := runHook(t, env, hookCase{
 		agent:   "claude-code",
 		event:   "PreToolUse",
 		payload: claudeMCPCall,
-		err:     errors.New("error code 404 (Not Found): <!doctype html>\n" + strings.Repeat("padding ", 100_000)),
+		err:     errors.New("error code 404 (Not Found): " + secret + " <!doctype html>\n" + strings.Repeat("padding ", 100_000)),
 	})
 
 	if !run.Denied {
 		t.Fatal("a non-2xx did not block the call")
 	}
-	if len(run.stderr) > 2_000 {
-		t.Errorf("stderr is %d bytes; an unbounded server body reached the transcript", len(run.stderr))
-	}
-	if len(run.stdout) > 4_000 {
-		t.Errorf("the protocol response is %d bytes; an unbounded server body reached the model", len(run.stdout))
-	}
 	for name, text := range map[string]string{"stderr": run.stderr, "stdout": run.stdout} {
-		if !strings.Contains(text, "404") {
-			t.Errorf("%s lost the part that identifies the failure: %q", name, text)
+		for _, forbidden := range []string{"404", secret, "doctype", "padding"} {
+			if strings.Contains(text, forbidden) {
+				t.Errorf("%s exposed %q from the server error: %q", name, forbidden, text)
+			}
 		}
+	}
+}
+
+type errorWriter struct{ err error }
+
+func (w errorWriter) Write([]byte) (int, error) { return 0, w.err }
+
+type shortWriter struct{}
+
+func (shortWriter) Write(p []byte) (int, error) { return len(p) - 1, nil }
+
+func TestRunReportsResponseWriteFailure(t *testing.T) {
+	wantErr := errors.New("output pipe closed")
+	var stderr bytes.Buffer
+	result := Run(t.Context(), Options{
+		Env:    normalizeFixture(t),
+		Agent:  "claude-code",
+		Event:  "PreToolUse",
+		Input:  strings.NewReader(claudeShellCall),
+		Stdout: errorWriter{err: wantErr},
+		Stderr: &stderr,
+		Decide: func(context.Context, types.EnforcementDecisionRequest) (types.EnforcementDecisionResponse, error) {
+			return types.EnforcementDecisionResponse{Decision: types.EnforcementDecisionDeny, Reason: "policy-secret"}, nil
+		},
+	})
+
+	if !result.Denied {
+		t.Fatal("write-failure test did not render a deny")
+	}
+	if !errors.Is(result.ResponseWriteErr, wantErr) {
+		t.Fatalf("ResponseWriteErr = %v, want it to wrap %v", result.ResponseWriteErr, wantErr)
+	}
+	if strings.Contains(string(result.Response), "policy-secret") || strings.Contains(stderr.String(), "policy-secret") {
+		t.Fatalf("policy reason leaked while reporting the write failure: response=%q stderr=%q", result.Response, stderr.String())
+	}
+}
+
+func TestRunReportsShortResponseWrite(t *testing.T) {
+	result := Run(t.Context(), Options{
+		Env:    normalizeFixture(t),
+		Agent:  "claude-code",
+		Event:  "PreToolUse",
+		Input:  strings.NewReader(claudeShellCall),
+		Stdout: shortWriter{},
+		Decide: func(context.Context, types.EnforcementDecisionRequest) (types.EnforcementDecisionResponse, error) {
+			return types.EnforcementDecisionResponse{Decision: types.EnforcementDecisionDeny}, nil
+		},
+	})
+	if !errors.Is(result.ResponseWriteErr, io.ErrShortWrite) {
+		t.Fatalf("ResponseWriteErr = %v, want io.ErrShortWrite", result.ResponseWriteErr)
 	}
 }
 

@@ -219,6 +219,32 @@ func TestRefusesEscapingIntermediateSymlink(t *testing.T) {
 	}
 }
 
+func TestUserConfigRefusesRootContainedIntermediateSymlink(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink creation requires privilege on Windows")
+	}
+	home := t.TempDir()
+	u := testUser(home)
+	actual := filepath.Join(home, "actual-copilot")
+	if err := os.MkdirAll(filepath.Join(actual, "hooks"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("actual-copilot", filepath.Join(home, ".copilot")); err != nil {
+		t.Fatal(err)
+	}
+	abs := filepath.Join(home, ".copilot", "hooks", "obot-sentry.json")
+
+	if _, _, err := readConfigFile(ScopeUser, home, abs); err == nil {
+		t.Fatal("read followed a user-scope intermediate symlink")
+	}
+	if err := commitConfigFile(ScopeUser, u, abs, []byte("managed")); err == nil {
+		t.Fatal("commit followed a user-scope intermediate symlink")
+	}
+	if _, err := os.Lstat(filepath.Join(actual, "hooks", "obot-sentry.json")); !os.IsNotExist(err) {
+		t.Fatalf("symlink target was changed: %v", err)
+	}
+}
+
 func TestReadRefusesPathEscapingHome(t *testing.T) {
 	home := t.TempDir()
 	outside := filepath.Join(filepath.Dir(home), "elsewhere.json")

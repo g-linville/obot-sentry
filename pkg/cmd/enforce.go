@@ -15,6 +15,7 @@ import (
 	"github.com/obot-platform/obot-sentry/pkg/enforce"
 	"github.com/obot-platform/obot-sentry/pkg/identity"
 	"github.com/obot-platform/obot-sentry/pkg/localagent"
+	"github.com/obot-platform/obot-sentry/pkg/mdmconfig"
 	"github.com/obot-platform/obot/apiclient/types"
 	"github.com/spf13/cobra"
 )
@@ -22,13 +23,20 @@ import (
 const enforceHookBudget = 5 * time.Second
 
 type Enforce struct {
-	ConfigFlags
 	Agent           string `usage:"local agent provider: claude-code, codex, cursor"`
 	Event           string `usage:"the agent's own pre-tool event: PreToolUse, beforeMCPExecution, preToolUse"`
 	Input           string `usage:"hook payload input path, or - for stdin" default:"-"`
 	ManagedBy       string `usage:"managed hook marker" name:"managed-by" hidden:"true"`
 	DryRun          bool   `usage:"normalize and resolve the call without asking for a verdict or answering the agent" name:"dry-run"`
 	PrintNormalized bool   `usage:"print the normalized decision request to stdout" name:"print-normalized"`
+
+	// serverURL is deliberately a hand-built flag rather than a tagged command
+	// field. The command builder binds every tagged field from the environment,
+	// but an enforcement hook must not let the user whose call is being checked
+	// redirect policy decisions with OBOT_SENTRY_SERVER_URL. An explicit flag is
+	// retained for diagnostics and tests; installed hooks never use it.
+	serverURL     string
+	loadMDMConfig func() (mdmconfig.Config, error)
 }
 
 func newEnforceCommand() (*cobra.Command, *Enforce) {
@@ -43,6 +51,7 @@ func (e *Enforce) Customize(cmd *cobra.Command) {
 	cmd.Use = "enforce"
 	cmd.Short = "Decide a pre-tool hook payload against Obot's allowlist"
 	cmd.Hidden = true
+	cmd.Flags().StringVar(&e.serverURL, "server-url", "", "Obot server base URL (overrides the MDM-configured value)")
 
 	// Flag and argument errors have to fail closed as well. Cobra reports them
 	// before RunE, so no protocol response is written, and a plain error exits 2
@@ -94,7 +103,28 @@ func (e *Enforce) Run(cmd *cobra.Command, _ []string) error {
 	if result.Unusable {
 		return &ExitCodeError{Code: 2, Err: errors.New(result.Reason)}
 	}
+	if result.ResponseWriteErr != nil {
+		return &ExitCodeError{Code: 2, Err: result.ResponseWriteErr}
+	}
 	return nil
+}
+
+// resolveConfig reads the protected MDM configuration and applies only an
+// explicit command-line override. Unlike the general ConfigFlags resolver it
+// has no environment-variable input.
+func (e *Enforce) resolveConfig() (mdmconfig.Config, error) {
+	load := e.loadMDMConfig
+	if load == nil {
+		load = mdmconfig.Load
+	}
+	cfg, err := load()
+	if err != nil {
+		return mdmconfig.Config{}, fmt.Errorf("reading MDM configuration: %w", err)
+	}
+	if e.serverURL != "" {
+		cfg.ServerURL = e.serverURL
+	}
+	return cfg, nil
 }
 
 // decider returns the call that asks Obot for a verdict. Every piece of setup it
@@ -112,7 +142,7 @@ func (e *Enforce) decider(envErr error) enforce.DecideFunc {
 		if envErr != nil {
 			return zero, fmt.Errorf("the machine environment could not be resolved: %w", envErr)
 		}
-		cfg, err := e.resolve()
+		cfg, err := e.resolveConfig()
 		if err != nil {
 			return zero, fmt.Errorf("the deployment configuration could not be read: %w", err)
 		}

@@ -1,6 +1,7 @@
 package enforce
 
 import (
+	"context"
 	"fmt"
 
 	"github.com/obot-platform/obot-sentry/pkg/localagent"
@@ -25,12 +26,12 @@ func (e Env) codexConfigPaths() []string {
 
 // resolveCodex resolves a Codex server name against the mcp_servers table of each
 // Codex config file.
-func resolveCodex(env Env, serverName string, tr *tracer) Resolution {
+func resolveCodex(ctx context.Context, loader *configLoader, env Env, serverName string, tr *tracer) Resolution {
 	// Codex folds punctuation to underscores on the way to a tool namespace, so a
 	// hyphenated config key arrives as probe_npx_stdio and an exact miss is retried
 	// against the normalized form.
 	names := lookup{names: []string{serverName}, form: formCodex}
-	m, out := resolveScopes(codexScopes(env), names, tr)
+	m, out := resolveScopes(ctx, codexScopes(loader, env), names, tr)
 	switch out {
 	case outcomeFound:
 		// The matched key, not serverName, which for a folded name appears nowhere in
@@ -46,7 +47,7 @@ func resolveCodex(env Env, serverName string, tr *tracer) Resolution {
 
 // codexScopes returns the Codex config files as ranked scopes. Codex takes no
 // project-scoped MCP configuration, so cwd plays no part.
-func codexScopes(env Env) []scope {
+func codexScopes(loader *configLoader, env Env) []scope {
 	paths := env.codexConfigPaths()
 	scopes := make([]scope, 0, len(paths))
 	for i, path := range paths {
@@ -54,7 +55,7 @@ func codexScopes(env Env) []scope {
 			path: path,
 			key:  codexServersKey,
 			rank: i,
-			load: codexServers(path),
+			load: codexServers(loader, path),
 		})
 	}
 	return scopes

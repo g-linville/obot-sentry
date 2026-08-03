@@ -1,6 +1,8 @@
 package enforce
 
 import (
+	"context"
+	"strings"
 	"testing"
 
 	"github.com/obot-platform/obot-sentry/pkg/localagent"
@@ -36,6 +38,53 @@ func TestResolutionString(t *testing.T) {
 			t.Errorf("%s: String() = %q, want %q", tc.name, got, tc.want)
 		}
 	}
+}
+
+func TestEnforcementURLKeepsOnlyMatchingComponents(t *testing.T) {
+	raw := "https://user:token-secret@example.com:8443/mcp/path?api_key=query-secret#fragment-secret"
+	want := "https://example.com:8443/mcp/path"
+	if got, ok := enforcementURL(raw); !ok || got != want {
+		t.Fatalf("enforcementURL(%q) = %q, want %q", raw, got, want)
+	}
+
+	res := resolved(Env{GOOS: "darwin"}, "server", mcpEntry{URL: raw})
+	if res.Identity.URL != want {
+		t.Fatalf("resolved URL = %q, want %q", res.Identity.URL, want)
+	}
+	for _, secret := range []string{"user", "token-secret", "api_key", "query-secret", "fragment-secret"} {
+		if got := string(mustJSON(res.Identity)); strings.Contains(got, secret) {
+			t.Fatalf("decision identity leaked %q: %s", secret, got)
+		}
+	}
+}
+
+func TestEnforcementURLRejectsSecretBearingInvalidForms(t *testing.T) {
+	for _, raw := range []string{
+		"https:token-secret@example.com/mcp",
+		"https://example.com/%zz?token-secret",
+		"example.com/mcp?token-secret",
+	} {
+		if got, ok := enforcementURL(raw); ok || got != "" {
+			t.Errorf("enforcementURL(%q) = (%q, %v), want rejected with no forwarded text", raw, got, ok)
+		}
+		res := resolved(Env{GOOS: "darwin"}, "server", mcpEntry{URL: raw})
+		if !res.Unresolved || res.Identity.URL != "" {
+			t.Errorf("resolved(%q) = %+v, want an unresolved identity", raw, res)
+		}
+		if strings.Contains(string(mustJSON(res)), "token-secret") {
+			t.Errorf("unresolved result leaked URL text: %+v", res)
+		}
+	}
+}
+
+func TestResolveContextHonorsCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	res := ResolveContext(ctx, Env{Home: t.TempDir(), GOOS: "darwin"}, ResolveRequest{
+		Agent:      localagent.Codex,
+		ServerName: "server",
+	})
+	assertUnresolved(t, res, "resolution was cancelled")
 }
 
 func TestBuiltinNamesMatchTheNamespaceForm(t *testing.T) {

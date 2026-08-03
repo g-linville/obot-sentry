@@ -1,6 +1,7 @@
 package enforce
 
 import (
+	"context"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -28,7 +29,7 @@ func TestLoadJSONStripsBOM(t *testing.T) {
 	f := newFixture(t, "darwin")
 	path := f.write(f.path("bom.json"), "\xef\xbb\xbf"+`{"mcpServers":{"linear":{"url":"https://x.example.com/sse"}}}`)
 
-	set, got := jsonServers(path)()
+	set, got := jsonServers(newConfigLoader(), path)(t.Context())
 	if got != loadOK {
 		t.Fatalf("load = %v, want loadOK", got)
 	}
@@ -44,6 +45,46 @@ func TestLoadJSONRefusesOversizedFiles(t *testing.T) {
 	var out map[string]any
 	if got := loadJSON(path, &out); got != loadUnusable {
 		t.Fatalf("oversized file = %v, want loadUnusable", got)
+	}
+}
+
+func TestConfigLoaderUsesOneFileSnapshot(t *testing.T) {
+	f := newFixture(t, "darwin")
+	path := f.write(f.path("mcp.json"), `{"mcpServers":{"first":{"url":"https://first.example.com"}}}`)
+	loader := newConfigLoader()
+	load := jsonServers(loader, path)
+
+	first, res := load(t.Context())
+	if res != loadOK || first["first"].URL != "https://first.example.com" {
+		t.Fatalf("first load = (%+v, %v)", first, res)
+	}
+	f.write(path, `{"mcpServers":{"second":{"url":"https://second.example.com"}}}`)
+	second, res := load(t.Context())
+	if res != loadOK {
+		t.Fatalf("second load result = %v", res)
+	}
+	if second["first"].URL != "https://first.example.com" {
+		t.Fatalf("cached snapshot changed after an on-disk edit: %+v", second)
+	}
+	if _, ok := second["second"]; ok {
+		t.Fatalf("same invocation observed a later file version: %+v", second)
+	}
+}
+
+func TestConfigLoaderCancellationDoesNotPoisonCache(t *testing.T) {
+	f := newFixture(t, "darwin")
+	path := f.write(f.path("mcp.json"), `{"mcpServers":{"server":{"url":"https://server.example.com"}}}`)
+	load := jsonServers(newConfigLoader(), path)
+
+	cancelled, cancel := context.WithCancel(t.Context())
+	cancel()
+	if _, res := load(cancelled); res != loadUnusable {
+		t.Fatalf("cancelled load = %v, want loadUnusable", res)
+	}
+
+	set, res := load(t.Context())
+	if res != loadOK || set["server"].URL != "https://server.example.com" {
+		t.Fatalf("later active load was poisoned by cancellation: (%+v, %v)", set, res)
 	}
 }
 

@@ -370,7 +370,7 @@ func claudeProjectScopes(t *testing.T, f *fixture, cwd string) []scope {
 	claudePath := f.homePath(".claude.json")
 	var claude claudeJSON
 	res := loadJSON(claudePath, &claude)
-	return projectScopes(f.Env, cwd, claudePath, claude, res, 1)
+	return projectScopes(newConfigLoader(), f.Env, cwd, claudePath, claude, res, 1)
 }
 
 func TestAncestorsNearestFirst(t *testing.T) {

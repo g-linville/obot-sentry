@@ -43,6 +43,10 @@ func runCommand(t *testing.T, root *cobra.Command, args ...string) (string, stri
 	return stdout.String(), stderr.String(), err
 }
 
+type errorWriter struct{ err error }
+
+func (w errorWriter) Write([]byte) (int, error) { return 0, w.err }
+
 func writeTempFile(t *testing.T, content string) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "payload.json")
@@ -126,11 +130,11 @@ func TestEnforceDeniesWithNoServerConfigured(t *testing.T) {
 	if out.HookSpecificOutput.PermissionDecision != "deny" {
 		t.Errorf("permissionDecision = %q, want deny", out.HookSpecificOutput.PermissionDecision)
 	}
-	if !strings.Contains(out.HookSpecificOutput.PermissionDecisionReason, "no Obot server URL is configured") {
-		t.Errorf("deny reason = %q, want it to name the missing configuration", out.HookSpecificOutput.PermissionDecisionReason)
+	if strings.Contains(out.HookSpecificOutput.PermissionDecisionReason, "no Obot server URL is configured") {
+		t.Errorf("deny response exposed infrastructure detail: %q", out.HookSpecificOutput.PermissionDecisionReason)
 	}
-	if !strings.Contains(stderr, "no Obot server URL is configured") {
-		t.Errorf("stderr = %q, want the blocking reason", stderr)
+	if stderr != "obot-sentry enforce: blocked\n" {
+		t.Errorf("stderr = %q, want only the static block notice", stderr)
 	}
 }
 
@@ -151,8 +155,8 @@ func TestEnforceUnsupportedAgentExitsNonZero(t *testing.T) {
 	if stdout != "" {
 		t.Errorf("stdout = %q, want nothing on the protocol channel", stdout)
 	}
-	if !strings.Contains(stderr, `unsupported enforcement agent "vscode"`) {
-		t.Errorf("stderr = %q, want the reason", stderr)
+	if stderr != "obot-sentry enforce: blocked\n" {
+		t.Errorf("stderr = %q, want only the static block notice", stderr)
 	}
 }
 
@@ -208,6 +212,71 @@ func TestEnforceManagedByMarker(t *testing.T) {
 		"enforce", "--agent", "claude-code", "--event", "PreToolUse",
 		"--input", input, "--managed-by", "someone-else", "--dry-run"); err == nil {
 		t.Fatal("a foreign --managed-by value was accepted")
+	}
+}
+
+func TestEnforceServerURLIgnoresEnvironment(t *testing.T) {
+	home := homeFixture(t)
+	input := writeTempFile(t, `{"tool_name":"Bash","cwd":"`+home+`"}`)
+	t.Setenv("OBOT_SENTRY_SERVER_URL", "https://attacker.invalid")
+	t.Setenv("ENFORCE_SERVER_URL", "https://also-attacker.invalid")
+
+	cmd, hook := newEnforceCommand()
+	cmd.SetArgs([]string{"--agent", "claude-code", "--event", "PreToolUse", "--input", input, "--dry-run"})
+	cmd.SetOut(&bytes.Buffer{})
+	cmd.SetErr(&bytes.Buffer{})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("enforce --dry-run: %v", err)
+	}
+	if hook.serverURL != "" {
+		t.Fatalf("server URL was populated from the environment: %q", hook.serverURL)
+	}
+
+	hook.loadMDMConfig = func() (mdmconfig.Config, error) {
+		return mdmconfig.Config{ServerURL: "https://mdm.example.com"}, nil
+	}
+	cfg, err := hook.resolveConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.ServerURL != "https://mdm.example.com" {
+		t.Fatalf("resolved server URL = %q, want the protected MDM value", cfg.ServerURL)
+	}
+}
+
+func TestEnforceExplicitServerURLOverridesMDM(t *testing.T) {
+	cmd, hook := newEnforceCommand()
+	if err := cmd.Flags().Parse([]string{"--server-url", "https://explicit.example.com"}); err != nil {
+		t.Fatal(err)
+	}
+	hook.loadMDMConfig = func() (mdmconfig.Config, error) {
+		return mdmconfig.Config{ServerURL: "https://mdm.example.com"}, nil
+	}
+	cfg, err := hook.resolveConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.ServerURL != "https://explicit.example.com" {
+		t.Fatalf("resolved server URL = %q, want explicit override", cfg.ServerURL)
+	}
+}
+
+func TestEnforceResponseWriteFailureExitsBlocking(t *testing.T) {
+	home := homeFixture(t)
+	input := writeTempFile(t, `{"tool_name":"Bash","cwd":"`+home+`"}`)
+	wantErr := errors.New("hook stdout is closed")
+	root := enforceRoot(t, mdmconfig.Config{})
+	root.SetOut(errorWriter{err: wantErr})
+	root.SetErr(&bytes.Buffer{})
+	root.SetArgs([]string{"enforce", "--agent", "claude-code", "--event", "PreToolUse", "--input", input})
+	err := root.Execute()
+
+	var exitErr *ExitCodeError
+	if !errors.As(err, &exitErr) || exitErr.Code != 2 {
+		t.Fatalf("err = %v, want blocking exit code 2", err)
+	}
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("err = %v, want it to wrap the output failure", err)
 	}
 }
 

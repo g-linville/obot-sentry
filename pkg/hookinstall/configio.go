@@ -25,7 +25,36 @@ func openConfigRoot(scope Scope, home, absPath string) (*os.Root, string, error)
 	if err != nil {
 		return nil, "", fmt.Errorf("opening root %q: %w", rootDir, err)
 	}
+	if scope == ScopeUser {
+		if err := rejectIntermediateSymlinks(root, rel, absPath); err != nil {
+			_ = root.Close()
+			return nil, "", err
+		}
+	}
 	return root, rel, nil
+}
+
+// rejectIntermediateSymlinks prevents a user-controlled hook path from
+// redirecting the privileged installer elsewhere within the user's home. A
+// machine path deliberately keeps os.Root's normal contained-symlink behavior
+// so macOS /etc -> /private/etc continues to work.
+func rejectIntermediateSymlinks(root *os.Root, rel, absPath string) error {
+	for _, dir := range dirChain(filepath.Dir(rel)) {
+		info, err := root.Lstat(dir)
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("refusing user config %q with symlinked parent %q", absPath, dir)
+		}
+		if !info.IsDir() {
+			return fmt.Errorf("refusing user config %q with non-directory parent %q", absPath, dir)
+		}
+	}
+	return nil
 }
 
 func rootFor(scope Scope, home, absPath string) (rootDir, rel string, err error) {
@@ -123,10 +152,26 @@ func commitConfigFile(scope Scope, u *TargetUser, absPath string, data []byte) e
 			return fmt.Errorf("creating config directory for %q: %w", absPath, err)
 		}
 	}
+	if scope == ScopeUser {
+		if err := rejectIntermediateSymlinks(root, rel, absPath); err != nil {
+			return err
+		}
+	}
+	if scope == ScopeMachine {
+		// Protect the containing directory before publishing the replacement. On
+		// Windows this prevents a normal user from deleting or replacing the hook
+		// during the interval between Rename and the destination ACL update.
+		if err := secureMachineConfigDir(absPath); err != nil {
+			return err
+		}
+	}
 	if err := writeAtomic(root, rel, data, filePerm); err != nil {
 		return err
 	}
-	if scope != ScopeUser || u == nil {
+	if scope == ScopeMachine {
+		return secureMachineConfig(absPath)
+	}
+	if u == nil {
 		return nil
 	}
 	return chownToUser(root, u, append(dirs, rel))

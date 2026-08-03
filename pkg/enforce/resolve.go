@@ -1,7 +1,9 @@
 package enforce
 
 import (
+	"context"
 	"fmt"
+	"net/url"
 	"strings"
 
 	"github.com/obot-platform/obot-sentry/pkg/localagent"
@@ -101,27 +103,41 @@ type ResolveRequest struct {
 // When no source matches, the result is marked unresolved with a specific reason
 // and reported to Obot anyway; the resolver never decides.
 func Resolve(env Env, req ResolveRequest) Resolution {
+	return ResolveContext(context.Background(), env, req)
+}
+
+// ResolveContext is Resolve with cancellation and a per-resolution config
+// snapshot. The hook path uses it so local resolution observes its deadline.
+func ResolveContext(ctx context.Context, env Env, req ResolveRequest) Resolution {
 	tr := &tracer{}
-	res := resolve(env, req, tr)
+	res := resolve(ctx, newConfigLoader(), env, req, tr)
 	res.Trace = tr.steps
 	return res
 }
 
-func resolve(env Env, req ResolveRequest, tr *tracer) Resolution {
+func resolve(ctx context.Context, loader *configLoader, env Env, req ResolveRequest, tr *tracer) Resolution {
+	if err := ctx.Err(); err != nil {
+		return unresolved(strings.TrimSpace(req.ServerName), "MCP server resolution was cancelled")
+	}
 	serverName := strings.TrimSpace(req.ServerName)
 	if serverName == "" {
 		return unresolved("", "the tool call did not name an MCP server")
 	}
+	var res Resolution
 	switch req.Agent {
 	case localagent.ClaudeCode:
-		return resolveClaudeCode(env, req, serverName, tr)
+		res = resolveClaudeCode(ctx, loader, env, req, serverName, tr)
 	case localagent.Codex:
-		return resolveCodex(env, serverName, tr)
+		res = resolveCodex(ctx, loader, env, serverName, tr)
 	case localagent.Cursor:
-		return resolveCursor(env, req, serverName, tr)
+		res = resolveCursor(ctx, loader, env, req, serverName, tr)
 	default:
 		return unresolved(serverName, fmt.Sprintf("unsupported agent %q", req.Agent))
 	}
+	if ctx.Err() != nil {
+		return unresolved(serverName, "MCP server resolution was cancelled")
+	}
+	return res
 }
 
 // resolved converts a matched configuration entry into a Resolution. A package
@@ -135,8 +151,12 @@ func resolve(env Env, req ResolveRequest, tr *tracer) Resolution {
 // uvx, is still a match; reporting the tool-name hint there would name a server
 // that appears in no configuration file.
 func resolved(env Env, matchedKey string, entry mcpEntry) Resolution {
-	if url := strings.TrimSpace(entry.URL); url != "" {
-		return Resolution{ServerName: matchedKey, Identity: types.EnforcementDecisionServer{URL: url}}
+	if rawURL := strings.TrimSpace(entry.URL); rawURL != "" {
+		safeURL, ok := enforcementURL(rawURL)
+		if !ok {
+			return unresolved(matchedKey, "the MCP server entry has an invalid URL")
+		}
+		return Resolution{ServerName: matchedKey, Identity: types.EnforcementDecisionServer{URL: safeURL}}
 	}
 
 	command := strings.TrimSpace(entry.Command)
@@ -162,6 +182,25 @@ func resolved(env Env, matchedKey string, entry mcpEntry) Resolution {
 			Command: executable,
 		},
 	}
+}
+
+// enforcementURL keeps exactly the URL components Obot's evaluator uses:
+// scheme, host (including an explicit port), and path. Credentials, queries,
+// and fragments do not participate in matching and must not leave the device.
+func enforcementURL(raw string) (string, bool) {
+	u, err := url.Parse(raw)
+	if err != nil || u.Scheme == "" || u.Hostname() == "" || u.Opaque != "" {
+		return "", false
+	}
+	// Reconstruct rather than mutate so no future url.URL field can
+	// accidentally carry data outside the evaluator's dimensions.
+	safe := url.URL{
+		Scheme:  u.Scheme,
+		Host:    u.Host,
+		Path:    u.Path,
+		RawPath: u.RawPath,
+	}
+	return safe.String(), true
 }
 
 // builtinAgentMCPServers is the per-agent set of MCP servers that ship inside the

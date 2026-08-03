@@ -4,6 +4,10 @@ package hookinstall
 
 import "os"
 
+func secureMachineConfig(string) error { return nil }
+
+func secureMachineConfigDir(string) error { return nil }
+
 func chownToUser(root *os.Root, u *TargetUser, paths []string) error {
 	for _, p := range paths {
 		if err := root.Lchown(p, u.UID, u.GID); err != nil {

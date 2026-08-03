@@ -198,8 +198,32 @@ func TestValidateExecutable(t *testing.T) {
 	}
 
 	t.Run("valid", func(t *testing.T) {
-		if err := validateExecutable(writeFile("valid", 0o755)); err != nil {
+		err := validateExecutable(writeFile("valid", 0o755))
+		if runtime.GOOS == "darwin" && os.Geteuid() != 0 {
+			if err == nil || !strings.Contains(err.Error(), "not root") {
+				t.Fatalf("expected non-root ownership rejection, got %v", err)
+			}
+			return
+		}
+		if err != nil {
 			t.Fatalf("expected valid executable, got %v", err)
+		}
+	})
+	t.Run("final symlink", func(t *testing.T) {
+		target := writeFile("symlink-target", 0o755)
+		link := filepath.Join(base, "symlink")
+		if err := os.Symlink(target, link); err != nil {
+			t.Fatal(err)
+		}
+		err := validateExecutable(link)
+		if runtime.GOOS == "darwin" && os.Geteuid() != 0 {
+			if err == nil || !strings.Contains(err.Error(), "not root") {
+				t.Fatalf("expected target ownership rejection through symlink, got %v", err)
+			}
+			return
+		}
+		if err != nil {
+			t.Fatalf("an executable symlink to an approved target was rejected: %v", err)
 		}
 	})
 	t.Run("not executable", func(t *testing.T) {
