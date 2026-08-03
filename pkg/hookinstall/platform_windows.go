@@ -80,8 +80,8 @@ func isSystemToken(token windows.Token) bool {
 }
 
 func validateExecutableOwner(path string, _ os.FileInfo) error {
-	// Resolve the accepted final symlink before querying security information so
-	// the target owner, not the reparse-point owner, is what is trusted.
+	// Resolve symlinks and reparse points throughout the path before querying
+	// security information, so ownership is checked on the final target.
 	target, err := filepath.EvalSymlinks(path)
 	if err != nil {
 		return fmt.Errorf("resolving obot-sentry executable %q: %w", path, err)

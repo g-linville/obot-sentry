@@ -102,6 +102,12 @@ func TestEnvPathFallsBackToTheConventionalLocation(t *testing.T) {
 	if want := f.path("ProgramData", "OpenAI", "Codex", "managed_config.toml"); got != want {
 		t.Fatalf("envPath = %q, want %q", got, want)
 	}
+
+	f.setenv("ProgramData", "relative-program-data")
+	got = f.Env.envPath("ProgramData", `C:\ProgramData`, "OpenAI", "Codex", "managed_config.toml")
+	if got != want {
+		t.Fatalf("envPath with relative override = %q, want fallback %q", got, want)
+	}
 }
 
 func TestMachinePathIsAbsoluteInProduction(t *testing.T) {

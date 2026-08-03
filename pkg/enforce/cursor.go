@@ -47,7 +47,7 @@ func resolveCursor(ctx context.Context, loader *configLoader, env Env, req Resol
 func cursorScopes(loader *configLoader, env Env, req ResolveRequest) []scope {
 	paths := make([]string, 0, len(req.WorkspaceRoots)+1)
 	for _, root := range req.WorkspaceRoots {
-		if root = strings.TrimSpace(root); root != "" {
+		if root = strings.TrimSpace(root); filepath.IsAbs(root) {
 			paths = append(paths, filepath.Join(filepath.Clean(root), ".cursor", "mcp.json"))
 		}
 	}

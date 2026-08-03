@@ -39,6 +39,9 @@ func NewEnv() (Env, error) {
 	if err != nil {
 		return Env{}, fmt.Errorf("resolve home dir: %w", err)
 	}
+	if !filepath.IsAbs(home) {
+		return Env{}, fmt.Errorf("resolved home dir %q is not absolute", home)
+	}
 	return Env{Home: home, GOOS: runtime.GOOS, Getenv: os.Getenv}, nil
 }
 
@@ -65,11 +68,12 @@ func (e Env) machinePath(abs string) string {
 	return filepath.Join(e.MachineRoot, filepath.FromSlash(abs))
 }
 
-// envPath resolves a Windows machine path rooted at an environment variable,
-// falling back to the conventional location when the variable is unset.
+// envPath resolves a Windows machine path rooted at an absolute environment
+// variable, falling back to the conventional location when it is unset or
+// relative.
 func (e Env) envPath(key, fallback string, elem ...string) string {
 	base := e.getenv(key)
-	if base == "" {
+	if base == "" || !filepath.IsAbs(base) {
 		return filepath.Join(append([]string{e.machinePath(fallback)}, elem...)...)
 	}
 	return filepath.Join(append([]string{base}, elem...)...)
@@ -148,21 +152,7 @@ func (l *configLoader) readConfigUncached(ctx context.Context, path string) ([]b
 	if err := ctx.Err(); err != nil {
 		return nil, loadUnusable
 	}
-	// Preflight the path before opening it so a user-created FIFO or device at a
-	// configuration location cannot block os.Open indefinitely. The descriptor
-	// is checked again below so a normal path replacement cannot turn a special
-	// file into accepted configuration.
-	info, err := os.Stat(path)
-	if err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
-			return nil, loadAbsent
-		}
-		return nil, loadUnusable
-	}
-	if !info.Mode().IsRegular() || info.Size() > maxConfigBytes {
-		return nil, loadUnusable
-	}
-	f, err := os.Open(path)
+	f, err := openConfigFile(path)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			return nil, loadAbsent
@@ -170,8 +160,10 @@ func (l *configLoader) readConfigUncached(ctx context.Context, path string) ([]b
 		return nil, loadUnusable
 	}
 	defer func() { _ = f.Close() }()
+	stopClose := context.AfterFunc(ctx, func() { _ = f.Close() })
+	defer stopClose()
 
-	info, err = f.Stat()
+	info, err := f.Stat()
 	if err != nil {
 		return nil, loadUnusable
 	}

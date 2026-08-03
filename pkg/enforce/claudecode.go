@@ -200,10 +200,11 @@ func nearestProjectFileDir(dirs []string) string {
 	return dirs[0]
 }
 
-// ancestors returns cwd and each directory above it, nearest first.
+// ancestors returns an absolute cwd and each directory above it, nearest first.
+// A relative cwd cannot identify a stable configuration scope and is ignored.
 func ancestors(cwd string) []string {
 	cwd = strings.TrimSpace(cwd)
-	if cwd == "" {
+	if cwd == "" || !filepath.IsAbs(cwd) {
 		return nil
 	}
 	dir := filepath.Clean(cwd)

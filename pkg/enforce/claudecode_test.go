@@ -392,6 +392,12 @@ func TestAncestorsEmptyCWD(t *testing.T) {
 	}
 }
 
+func TestAncestorsRejectsRelativeCWD(t *testing.T) {
+	if got := ancestors(filepath.Join("project", "subdir")); got != nil {
+		t.Fatalf("ancestors = %v, want nil for a relative cwd", got)
+	}
+}
+
 // TestAncestorsIsBounded keeps a pathological path from turning into a scope per
 // level.
 func TestAncestorsIsBounded(t *testing.T) {

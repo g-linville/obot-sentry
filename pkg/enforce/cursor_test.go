@@ -38,6 +38,16 @@ func TestCursorFileOrder(t *testing.T) {
 	}
 }
 
+func TestCursorIgnoresRelativeWorkspaceRoots(t *testing.T) {
+	f := newFixture(t, "darwin")
+	res := Resolve(f.Env, cursorReq("linear", filepath.Join("relative", "workspace")))
+
+	want := []string{f.homePath(".cursor", "mcp.json")}
+	if got := consultedPaths(res); !slices.Equal(got, want) {
+		t.Fatalf("consulted\n%v\nwant\n%v", got, want)
+	}
+}
+
 func TestCursorHTTPServerResolvesThroughTheLookup(t *testing.T) {
 	f := newFixture(t, "darwin")
 	ws := f.mkdir(f.path("ws"))
