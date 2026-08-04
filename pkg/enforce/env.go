@@ -25,6 +25,9 @@ type Env struct {
 	GOOS string
 	// Getenv resolves an environment variable. Nil falls back to os.Getenv.
 	Getenv func(string) string
+	// Environ returns the complete process environment for security checks that
+	// must recognize prefix families such as NPM_CONFIG_* and UV_*.
+	Environ func() []string
 	// MachineRoot is prepended to the fixed machine-scoped absolute paths — the
 	// macOS Claude Code managed MCP config and Codex's /etc config. It is empty
 	// in production and a fixture-tree root in tests. Machine paths that come
@@ -42,7 +45,7 @@ func NewEnv() (Env, error) {
 	if !filepath.IsAbs(home) {
 		return Env{}, fmt.Errorf("resolved home dir %q is not absolute", home)
 	}
-	return Env{Home: home, GOOS: runtime.GOOS, Getenv: os.Getenv}, nil
+	return Env{Home: home, GOOS: runtime.GOOS, Getenv: os.Getenv, Environ: os.Environ}, nil
 }
 
 func (e Env) windows() bool { return e.GOOS == "windows" }
@@ -52,6 +55,13 @@ func (e Env) getenv(key string) string {
 		return os.Getenv(key)
 	}
 	return e.Getenv(key)
+}
+
+func (e Env) environ() []string {
+	if e.Environ == nil {
+		return nil
+	}
+	return e.Environ()
 }
 
 // homePath joins slash-separated elements onto the home directory.

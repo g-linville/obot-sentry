@@ -256,6 +256,112 @@ func TestEnforceServerURLIgnoresEnvironment(t *testing.T) {
 	}
 }
 
+func TestEnforceProtocolFlagsIgnoreEnvironment(t *testing.T) {
+	home := homeFixture(t)
+	input := writeTempFile(t, `{"tool_name":"Bash","cwd":"`+home+`"}`)
+	root := enforceRoot(t, mdmconfig.Config{})
+
+	// These names used to be implicit bindings created by the command builder.
+	// A hook inherits the invoking agent's environment, so either debug flag
+	// could turn a real decision into a successful, response-free dry run or
+	// corrupt stdout with diagnostic JSON.
+	t.Setenv("ENFORCE_DRY_RUN", "true")
+	t.Setenv("ENFORCE_PRINT_NORMALIZED", "true")
+
+	stdout, stderr, err := runCommand(t, root,
+		"enforce", "--agent", "claude-code", "--event", "PreToolUse", "--input", input)
+	if err != nil {
+		t.Fatalf("the hook exited non-zero: %v", err)
+	}
+	var out struct {
+		HookSpecificOutput struct {
+			PermissionDecision string `json:"permissionDecision"`
+		} `json:"hookSpecificOutput"`
+	}
+	if err := json.Unmarshal([]byte(stdout), &out); err != nil {
+		t.Fatalf("stdout is not one protocol response: %v (%q)", err, stdout)
+	}
+	if out.HookSpecificOutput.PermissionDecision != "deny" {
+		t.Fatalf("permissionDecision = %q, want deny", out.HookSpecificOutput.PermissionDecision)
+	}
+	if stderr != "obot-sentry enforce: blocked\n" {
+		t.Fatalf("stderr = %q, want a real blocking decision", stderr)
+	}
+}
+
+func TestEnforceInputIgnoresEnvironment(t *testing.T) {
+	home := homeFixture(t)
+	root := enforceRoot(t, mdmconfig.Config{})
+	fake := writeTempFile(t, `{"tool_name":"Read","cwd":"`+home+`"}`)
+	t.Setenv("ENFORCE_INPUT", fake)
+
+	stdinPath := writeTempFile(t, `{"tool_name":"Bash","cwd":"`+home+`"}`)
+	stdin, err := os.Open(stdinPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	originalStdin := os.Stdin
+	os.Stdin = stdin
+	t.Cleanup(func() {
+		os.Stdin = originalStdin
+		_ = stdin.Close()
+	})
+
+	stdout, _, err := runCommand(t, root,
+		"enforce", "--agent", "codex", "--event", "PreToolUse", "--dry-run", "--print-normalized")
+	if err != nil {
+		t.Fatalf("enforce --dry-run: %v", err)
+	}
+	var req types.EnforcementDecisionRequest
+	if err := json.Unmarshal([]byte(stdout), &req); err != nil {
+		t.Fatalf("stdout is not the normalized request: %v (%q)", err, stdout)
+	}
+	if req.Tool != "Bash" || req.Kind != "shell" {
+		t.Fatalf("request = %+v, want the real stdin payload rather than ENFORCE_INPUT", req)
+	}
+}
+
+func TestEnforceAgentAndEventIgnoreEnvironment(t *testing.T) {
+	home := homeFixture(t)
+	input := writeTempFile(t, `{"tool_name":"Bash","cwd":"`+home+`"}`)
+	root := enforceRoot(t, mdmconfig.Config{})
+	t.Setenv("ENFORCE_AGENT", "claude-code")
+	t.Setenv("ENFORCE_EVENT", "PreToolUse")
+
+	stdout, _, err := runCommand(t, root, "enforce", "--input", input)
+	var exitErr *ExitCodeError
+	if !errors.As(err, &exitErr) || exitErr.Code != 2 {
+		t.Fatalf("err = %v, want blocking exit code 2 with no explicit agent or event", err)
+	}
+	if stdout != "" {
+		t.Fatalf("stdout = %q, want no protocol response for an unusable invocation", stdout)
+	}
+}
+
+func TestEnforceManagedByIgnoresEnvironment(t *testing.T) {
+	home := homeFixture(t)
+	input := writeTempFile(t, `{"tool_name":"Bash","cwd":"`+home+`"}`)
+	root := enforceRoot(t, mdmconfig.Config{})
+	t.Setenv("ENFORCE_MANAGED_BY", "someone-else")
+
+	stdout, _, err := runCommand(t, root,
+		"enforce", "--agent", "claude-code", "--event", "PreToolUse", "--input", input)
+	if err != nil {
+		t.Fatalf("environment supplied --managed-by affected the invocation: %v", err)
+	}
+	var out struct {
+		HookSpecificOutput struct {
+			PermissionDecision string `json:"permissionDecision"`
+		} `json:"hookSpecificOutput"`
+	}
+	if err := json.Unmarshal([]byte(stdout), &out); err != nil {
+		t.Fatalf("stdout is not a hook response: %v (%q)", err, stdout)
+	}
+	if out.HookSpecificOutput.PermissionDecision != "deny" {
+		t.Fatalf("permissionDecision = %q, want deny", out.HookSpecificOutput.PermissionDecision)
+	}
+}
+
 func TestEnforceExplicitServerURLOverridesMDM(t *testing.T) {
 	cmd, hook := newEnforceCommand()
 	if err := cmd.Flags().Parse([]string{"--server-url", "https://explicit.example.com"}); err != nil {

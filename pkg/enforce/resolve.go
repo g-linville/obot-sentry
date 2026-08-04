@@ -11,11 +11,12 @@ import (
 )
 
 // mcpEntry is the entirety of an MCP server configuration entry the resolver
-// reads: a URL, or a command plus its arguments.
+// reads: a URL, or a command plus its arguments and configured environment.
 type mcpEntry struct {
-	URL     string   `json:"url" toml:"url"`
-	Command string   `json:"command" toml:"command"`
-	Args    []string `json:"args" toml:"args"`
+	URL         string            `json:"url" toml:"url"`
+	Command     string            `json:"command" toml:"command"`
+	Args        []string          `json:"args" toml:"args"`
+	Environment map[string]string `json:"env" toml:"env"`
 }
 
 // TraceStep records one source the resolver consulted. The trace is what makes
@@ -172,6 +173,19 @@ func resolved(env Env, matchedKey string, entry mcpEntry) Resolution {
 	pkg, err := resolvePackage(command, entry.Args, env.GOOS)
 	if err != nil {
 		res := unresolved(matchedKey, err.Error())
+		res.Identity.Command = executable
+		return res
+	}
+	run, _ := parseRunner(command, env.GOOS) // resolvePackage already accepted it.
+	if name, ok := unsafeConfiguredPackageEnv(run, entry.Environment); ok {
+		res := unresolved(matchedKey, fmt.Sprintf(
+			"stdio package runner environment variable %q can change which code executes", name))
+		res.Identity.Command = executable
+		return res
+	}
+	if name, ok := unsafeInheritedPackageEnv(run, env.environ()); ok {
+		res := unresolved(matchedKey, fmt.Sprintf(
+			"inherited environment variable %q can change which code the stdio package runner executes", name))
 		res.Identity.Command = executable
 		return res
 	}

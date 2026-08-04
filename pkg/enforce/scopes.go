@@ -159,7 +159,7 @@ func agree(peers []match) (match, bool) {
 }
 
 func sameEntry(a, b mcpEntry) bool {
-	return a.URL == b.URL && a.Command == b.Command && slices.Equal(a.Args, b.Args)
+	return a.URL == b.URL && a.Command == b.Command && slices.Equal(a.Args, b.Args) && maps.Equal(a.Environment, b.Environment)
 }
 
 func ambiguous(agent localagent.Agent, name string) Resolution {

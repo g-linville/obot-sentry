@@ -96,6 +96,26 @@ func TestResolveScopesPeersThatAgree(t *testing.T) {
 	}
 }
 
+func TestResolveScopesPeersWithDifferentEnvironmentConflict(t *testing.T) {
+	base := mcpEntry{
+		Command: "npx",
+		Args:    []string{"-y", "linear-mcp"},
+		Environment: map[string]string{
+			"LINEAR_TOKEN": "project-token",
+		},
+	}
+	shadow := base
+	shadow.Environment = map[string]string{"LINEAR_TOKEN": "user-token"}
+	scopes := []scope{
+		fixedScope("project", 0, serverSet{"linear": base}),
+		fixedScope("user", 0, serverSet{"linear": shadow}),
+	}
+
+	if _, out := resolveScopes(t.Context(), scopes, exactly("linear"), &tracer{}); out != outcomeAmbiguous {
+		t.Fatalf("outcome = %v, want outcomeAmbiguous for definitions that differ by environment", out)
+	}
+}
+
 // TestResolveScopesPeersRecordEveryMatch covers the diagnostic: for a conflict,
 // the two FOUND lines are the whole explanation of the denial.
 func TestResolveScopesPeersRecordEveryMatch(t *testing.T) {

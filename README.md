@@ -130,6 +130,16 @@ change identity are accepted: `-y`, `-q`, `--offline`, `npx -p/--package`,
 `uvx --from`, and `uvx -p/--python` (note `-p` means `--package` to npx and
 `--python` to uvx).
 
+The same rule applies to environment variables. An MCP entry is unidentified
+when its `env` redirects the runner or package source or injects code, including
+`PATH`, `NODE_OPTIONS`, `NPM_CONFIG_*`, `COREPACK_*`, `UV_*`, `PYTHONPATH`, and
+dynamic-loader variables. Sensitive variables that are inputs to the server,
+such as `GITHUB_TOKEN`, are accepted and never sent in the decision request.
+Identity-changing variables inherited by obot-sentry are refused as well. An
+ordinary inherited `PATH` is accepted, including one that finds `npx` or `uvx`
+under Homebrew or another user-local installation; runner ownership is not an
+allowlist dimension.
+
 Names are canonicalized the way each registry does, on the device and again when
 an allowlist entry is saved, so the two agree: PyPI by PEP 503
 (`Mcp_Server.Git` → `mcp-server-git`), npm by lowercasing with the scope

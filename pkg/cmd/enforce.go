@@ -23,20 +23,20 @@ import (
 const enforceHookBudget = 5 * time.Second
 
 type Enforce struct {
-	Agent           string `usage:"local agent provider: claude-code, codex, cursor"`
-	Event           string `usage:"the agent's own pre-tool event: PreToolUse, beforeMCPExecution, preToolUse"`
-	Input           string `usage:"hook payload input path, or - for stdin" default:"-"`
-	ManagedBy       string `usage:"managed hook marker" name:"managed-by" hidden:"true"`
-	DryRun          bool   `usage:"normalize and resolve the call without asking for a verdict or answering the agent" name:"dry-run"`
-	PrintNormalized bool   `usage:"print the normalized decision request to stdout" name:"print-normalized"`
-
-	// serverURL is deliberately a hand-built flag rather than a tagged command
-	// field. The command builder binds every tagged field from the environment,
-	// but an enforcement hook must not let the user whose call is being checked
-	// redirect policy decisions with OBOT_SENTRY_SERVER_URL. An explicit flag is
-	// retained for diagnostics and tests; installed hooks never use it.
-	serverURL     string
-	loadMDMConfig func() (mdmconfig.Config, error)
+	// These are deliberately hand-built flags rather than tagged command fields.
+	// The command builder gives every exported field an implicit environment
+	// binding, but an enforcement hook must consume the agent's stdin and make a
+	// real, protocol-clean decision regardless of the environment it inherits.
+	// Every value may still be supplied explicitly; installed hooks pin agent,
+	// event, and managed-by while diagnostics may opt into the others.
+	agent           string
+	event           string
+	managedBy       string
+	input           string
+	dryRun          bool
+	printNormalized bool
+	serverURL       string
+	loadMDMConfig   func() (mdmconfig.Config, error)
 }
 
 func newEnforceCommand() (*cobra.Command, *Enforce) {
@@ -51,6 +51,15 @@ func (e *Enforce) Customize(cmd *cobra.Command) {
 	cmd.Use = "enforce"
 	cmd.Short = "Decide a pre-tool hook payload against Obot's allowlist"
 	cmd.Hidden = true
+	cmd.Flags().StringVar(&e.agent, "agent", "", "local agent provider: claude-code, codex, cursor")
+	cmd.Flags().StringVar(&e.event, "event", "", "the agent's own pre-tool event: PreToolUse, beforeMCPExecution, preToolUse")
+	cmd.Flags().StringVar(&e.managedBy, "managed-by", "", "managed hook marker")
+	if err := cmd.Flags().MarkHidden("managed-by"); err != nil {
+		panic(err)
+	}
+	cmd.Flags().StringVar(&e.input, "input", "-", "hook payload input path, or - for stdin")
+	cmd.Flags().BoolVar(&e.dryRun, "dry-run", false, "normalize and resolve the call without asking for a verdict or answering the agent")
+	cmd.Flags().BoolVar(&e.printNormalized, "print-normalized", false, "print the normalized decision request to stdout")
 	cmd.Flags().StringVar(&e.serverURL, "server-url", "", "Obot server base URL (overrides the MDM-configured value)")
 
 	// Flag and argument errors have to fail closed as well. Cobra reports them
@@ -72,11 +81,11 @@ func (e *Enforce) Run(cmd *cobra.Command, _ []string) error {
 	// hook-install recognizes when it converges its own hook entries. A foreign
 	// value is an invocation we do not understand, so it fails closed through the
 	// same blocking exit as a flag we cannot parse.
-	if e.ManagedBy != "" && e.ManagedBy != "obot-sentry" {
+	if e.managedBy != "" && e.managedBy != "obot-sentry" {
 		return &ExitCodeError{Code: 2, Err: errors.New("--managed-by must be empty or obot-sentry")}
 	}
 
-	input, closeInput, err := openEnforceInput(e.Input)
+	input, closeInput, err := openEnforceInput(e.input)
 	if err != nil {
 		// Fail closed with no protocol channel available: nothing about the
 		// invocation is usable yet, not even which agent is waiting on stdout.
@@ -91,14 +100,14 @@ func (e *Enforce) Run(cmd *cobra.Command, _ []string) error {
 
 	result := enforce.Run(ctx, enforce.Options{
 		Env:             env,
-		Agent:           e.Agent,
-		Event:           e.Event,
+		Agent:           e.agent,
+		Event:           e.event,
 		Input:           input,
 		Stdout:          cmd.OutOrStdout(),
 		Stderr:          cmd.ErrOrStderr(),
 		Decide:          e.decider(envErr),
-		PrintNormalized: e.PrintNormalized,
-		DryRun:          e.DryRun,
+		PrintNormalized: e.printNormalized,
+		DryRun:          e.dryRun,
 	})
 	if result.Unusable {
 		return &ExitCodeError{Code: 2, Err: errors.New(result.Reason)}

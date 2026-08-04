@@ -77,6 +77,167 @@ func TestEnforcementURLRejectsSecretBearingInvalidForms(t *testing.T) {
 	}
 }
 
+func TestPackageEnvironmentThatChangesExecutionIsUnresolved(t *testing.T) {
+	cases := []struct {
+		name    string
+		command string
+		args    []string
+		env     map[string]string
+		wantVar string
+	}{
+		{
+			name:    "npx registry",
+			command: "npx",
+			args: []string{
+				"allowed@1.2.3",
+			},
+			env: map[string]string{
+				"NPM_CONFIG_REGISTRY": "https://attacker.invalid",
+			},
+			wantVar: "NPM_CONFIG_REGISTRY",
+		},
+		{
+			name:    "npx code injection",
+			command: "npx",
+			args: []string{
+				"allowed@1.2.3",
+			},
+			env: map[string]string{
+				"NODE_OPTIONS": "--require=/tmp/attacker.js",
+			},
+			wantVar: "NODE_OPTIONS",
+		},
+		{
+			name:    "npx runner replacement",
+			command: "npx",
+			args: []string{
+				"allowed@1.2.3",
+			},
+			env: map[string]string{
+				"PATH": "/tmp/attacker-bin",
+			},
+			wantVar: "PATH",
+		},
+		{
+			name:    "uvx index",
+			command: "uvx",
+			args: []string{
+				"allowed@1.2.3",
+			},
+			env: map[string]string{
+				"UV_INDEX_URL": "https://attacker.invalid/simple",
+			},
+			wantVar: "UV_INDEX_URL",
+		},
+		{
+			name:    "uvx code injection",
+			command: "uvx",
+			args: []string{
+				"allowed@1.2.3",
+			},
+			env: map[string]string{
+				"PYTHONPATH": "/tmp/attacker-python",
+			},
+			wantVar: "PYTHONPATH",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			res := resolved(Env{GOOS: "darwin"}, "server", mcpEntry{
+				Command:     tc.command,
+				Args:        tc.args,
+				Environment: tc.env,
+			})
+			assertUnresolved(t, res, tc.wantVar)
+			if strings.Contains(res.Reason, "attacker") {
+				t.Fatalf("unresolved reason leaked an environment value: %q", res.Reason)
+			}
+		})
+	}
+}
+
+func TestInheritedPackageEnvironmentThatChangesExecutionIsUnresolved(t *testing.T) {
+	cases := []struct {
+		name    string
+		command string
+		args    []string
+		environ []string
+		wantVar string
+	}{
+		{
+			name:    "npx registry",
+			command: "npx",
+			args: []string{
+				"allowed",
+			},
+			environ: []string{
+				"NPM_CONFIG_REGISTRY=https://attacker.invalid",
+			},
+			wantVar: "NPM_CONFIG_REGISTRY",
+		},
+		{
+			name:    "npx code injection",
+			command: "npx",
+			args: []string{
+				"allowed",
+			},
+			environ: []string{
+				"NODE_OPTIONS=--require=/tmp/attacker.js",
+			},
+			wantVar: "NODE_OPTIONS",
+		},
+		{
+			name:    "uvx index",
+			command: "uvx",
+			args: []string{
+				"allowed",
+			},
+			environ: []string{
+				"UV_INDEX_URL=https://attacker.invalid/simple",
+			},
+			wantVar: "UV_INDEX_URL",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			res := resolved(Env{
+				GOOS:    "darwin",
+				Environ: func() []string { return tc.environ },
+			}, "server", mcpEntry{
+				Command: tc.command,
+				Args:    tc.args,
+			})
+			assertUnresolved(t, res, tc.wantVar)
+		})
+	}
+}
+
+func TestPackageEnvironmentAllowsSecretsAndHomebrewPath(t *testing.T) {
+	res := resolved(Env{
+		GOOS: "darwin",
+		Environ: func() []string {
+			return []string{
+				"PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin",
+				"NPM_CONFIG_PREFIX=/opt/homebrew",
+				"NODE_EXTRA_CA_CERTS=/managed/corporate-ca.pem",
+			}
+		},
+	}, "server", mcpEntry{
+		Command:     "npx",
+		Args:        []string{"allowed@1.2.3"},
+		Environment: map[string]string{"GITHUB_TOKEN": "secret-value"},
+	})
+	if res.Unresolved {
+		t.Fatalf("ordinary secret environment and Homebrew path were rejected: %s", res.Reason)
+	}
+	if res.Identity.Package == nil || res.Identity.Package.Name != "allowed" {
+		t.Fatalf("package = %+v, want npm/allowed", res.Identity.Package)
+	}
+	if strings.Contains(string(mustJSON(res)), "secret-value") {
+		t.Fatal("the package resolution leaked a configured secret")
+	}
+}
+
 func TestResolveContextHonorsCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()

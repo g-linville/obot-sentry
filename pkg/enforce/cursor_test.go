@@ -162,6 +162,20 @@ func TestCursorCollidingNameIsUnresolved(t *testing.T) {
 	}
 }
 
+func TestCursorCollidingNameWithDifferentEnvironmentIsUnresolved(t *testing.T) {
+	f := newFixture(t, "darwin")
+	ws := f.mkdir(f.path("ws"))
+	f.write(filepath.Join(ws, ".cursor", "mcp.json"), `{"mcpServers":{
+		"linear":{"command":"npx","args":["linear-mcp"],"env":{"LINEAR_TOKEN":"project-token"}}
+	}}`)
+	f.write(f.homePath(".cursor", "mcp.json"), `{"mcpServers":{
+		"linear":{"command":"npx","args":["linear-mcp"],"env":{"LINEAR_TOKEN":"user-token"}}
+	}}`)
+
+	res := Resolve(f.Env, cursorReq("linear", ws))
+	assertUnresolved(t, res, "conflicting definitions in more than one Cursor configuration scope")
+}
+
 // TestCursorSingleScopeResolves is the other half of the collision rule: a
 // name declared once resolves exactly as before, even though every candidate file
 // is consulted.
