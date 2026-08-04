@@ -32,10 +32,10 @@ yourself.
 ## Run a scan
 
 ```sh
-obot-sentry scan --submit
+obot-sentry scan --submit --force
 ```
 
-By default, scans are submitted at most once every {{.scanIntervalMinutes}} minutes; runs within that window skip submission.
+Scans are submitted at most once every {{.scanIntervalMinutes}} minutes, and a run within that window skips submission. `--force` bypasses the interval, so a scan you run by hand always submits.
 
 ## Install hooks
 

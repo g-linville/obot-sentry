@@ -26,6 +26,7 @@ type Scan struct {
 	JSON     bool `usage:"Print the scan result as JSON"`
 	Quiet    bool `usage:"Suppress the result output" short:"q"`
 	Submit   bool `usage:"Submit the scan to the configured Obot server, enrolling first if needed" env:"OBOT_SENTRY_SCAN_SUBMIT"`
+	Force    bool `usage:"Submit even when the last submission is still within the scan interval; requires --submit" env:"OBOT_SENTRY_SCAN_FORCE"`
 	Timeout  int  `usage:"Number of seconds to wait for the scan to complete" default:"300" env:"OBOT_SENTRY_SCAN_TIMEOUT"`
 	MaxDepth int  `usage:"Maximum path depth (in segments below each scan root) to crawl for project-scope configs and skills" default:"5" env:"OBOT_SENTRY_SCAN_MAX_DEPTH"`
 }
@@ -42,6 +43,10 @@ func (s *Scan) Run(cmd *cobra.Command, _ []string) error {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, time.Duration(s.Timeout)*time.Second)
 		defer cancel()
+	}
+
+	if s.Force && !s.Submit {
+		return fmt.Errorf("--force requires --submit")
 	}
 
 	cfg, err := s.resolve()
@@ -62,7 +67,9 @@ func (s *Scan) Run(cmd *cobra.Command, _ []string) error {
 	if cacheErr != nil {
 		_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "warning: resolving cache directory: %v\n", cacheErr)
 	}
-	if s.Submit && cacheErr == nil {
+	// --force is the manual override: submit now, whenever the last
+	// submission happened, so there is nothing to throttle against.
+	if s.Submit && !s.Force && cacheErr == nil {
 		scanState, err := state.LoadScanState(cacheDir)
 		if err != nil {
 			_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "warning: reading scan state: %v\n", err)

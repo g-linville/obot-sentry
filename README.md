@@ -6,7 +6,7 @@ It enrolls each machine with an [Obot](https://github.com/obot-platform/obot) se
 
 ## How it works
 
-- **Machine-wide scheduler entries.** The MDM installer registers a scan task that the OS runs *as each signed-in user*: on Windows it uses a `BUILTIN\Users` group principal (logon + a 10-minute poll). Each run is a plain `obot-sentry scan --submit --quiet` in the user's own session, so attribution, paths, and permissions are native — no privileged fan-out and no MDM per-user scheduling. The poll is cheap: obot-sentry throttles real submissions to the MDM-configured `ScanIntervalMinutes` (default 60, clamped to 15–1440) against its per-user scan state, so admins retune the cadence from the MDM alone. Users who aren't signed in aren't scanned; their inventory can't change while they're signed out, so nothing is missed beyond first-report latency for accounts that haven't signed in since install. The installer also registers an elevated SYSTEM task that runs `obot-sentry hook-install` at logon and hourly. Because `hook-install` targets only the active console user, it converges at each sign-in (after a one-minute settle) plus the install kick, with the hourly run picking up later drift and console-user switches.
+- **Machine-wide scheduler entries.** The MDM installer registers a scan task that the OS runs *as each signed-in user*: on Windows it uses a `BUILTIN\Users` group principal (logon + a 10-minute poll). Each run is a plain `obot-sentry scan --submit --quiet` in the user's own session, so attribution, paths, and permissions are native — no privileged fan-out and no MDM per-user scheduling. The poll is cheap: obot-sentry throttles real submissions to the MDM-configured `ScanIntervalMinutes` (default 60, clamped to 15–1440) against its per-user scan state, so admins retune the cadence from the MDM alone (`scan --submit --force` bypasses the throttle for a one-off manual submission). Users who aren't signed in aren't scanned; their inventory can't change while they're signed out, so nothing is missed beyond first-report latency for accounts that haven't signed in since install. The installer also registers an elevated SYSTEM task that runs `obot-sentry hook-install` at logon and hourly. Because `hook-install` targets only the active console user, it converges at each sign-in (after a one-minute settle) plus the install kick, with the hourly run picking up later drift and console-user switches.
 - **Enrollment.** Configuration (server URL + an `ode1-...` enrollment credential) is pushed by the MDM — via registry values on Windows, a managed-preferences profile on macOS. On the machine's first scan — by whichever user runs first — obot-sentry generates a shared Ed25519 identity key in the machine-scoped data dir (`%PROGRAMDATA%\obot\obot-sentry` on Windows, `/Library/Application Support/obot/obot-sentry` on macOS; both are prepared user-writable by the installer, with a per-user fallback when unavailable) and enrolls the public key via `POST /api/mdm/enroll` (trust-on-first-use). The device ID derives from the machine ID + key fingerprint, so all users present one device — and a lost key simply mints a fresh device ID instead of a TOFU conflict. Each user's first scan re-enrolls the same identity, which is an idempotent update server-side.
 - **Submission.** Every submission is authenticated with a short-lived self-signed JWT (`aud=obot/device`) verified server-side against the enrolled key; scans land via `POST /api/devices/scans`, attributed to the submitting user by the manifest's `username`. Local-agent audit logs land via `POST /api/local-agent-audit-logs`, with the server stamping authoritative device attribution from the JWT.
 - **Local-agent audit hooks.** Managed hook configuration invokes the hidden `obot-sentry audit submit` command for supported local agents. The hook parser normalizes terminal tool-call events, submits them fail-open, and writes only warnings to stderr when enrollment or submission is unavailable so agent execution is not blocked.
@@ -18,6 +18,7 @@ It enrolls each machine with an [Obot](https://github.com/obot-platform/obot) se
 
 ```
 obot-sentry scan              # build + print the manifest (add --submit to enroll + upload)
+                              #   --submit --force ignores the scan interval and submits now
 obot-sentry enroll            # explicit enrollment, for verifying a configuration
 obot-sentry hook-install      # install managed local-agent hooks (root/Administrator)
                               #   --enforce also installs the tool-call enforcement hooks
@@ -292,7 +293,7 @@ Obot reads the assembled tree via `OBOT_SERVER_MDM_ASSETS_PATH`.
 | Platform | installer | scheduling | tenant config |
 |---|---|---|---|
 | Intune (Windows) | `.msi` wrapped as `.intunewin` | per-user scan task (logon + 10-min poll, submissions throttled to `ScanIntervalMinutes`) plus elevated SYSTEM hook-install task (logon + hourly) | MSI properties → `HKLM\SOFTWARE\Obot\obot-sentry` |
-| Manual (macOS) | universal binary installed to `/usr/local/bin` | none — run `obot-sentry scan --submit` manually | `OBOT_SENTRY_*` environment variables |
+| Manual (macOS) | universal binary installed to `/usr/local/bin` | none — run `obot-sentry scan --submit --force` manually | `OBOT_SENTRY_*` environment variables |
 
 ## Development
 
@@ -307,3 +308,6 @@ Local end-to-end against a dev server:
 ```
 OBOT_SENTRY_SERVER_URL=http://localhost:8080 OBOT_SENTRY_ENROLLMENT_KEY=ode1-... bin/obot-sentry scan --submit
 ```
+
+Repeat submissions inside the scan interval are throttled; add `--force` to
+submit every time.
