@@ -1,6 +1,7 @@
 package enforce
 
 import (
+	"context"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -9,14 +10,14 @@ import (
 )
 
 // resolveCursor resolves a Cursor beforeMCPExecution display name.
-func resolveCursor(env Env, req ResolveRequest, displayName string, tr *tracer) Resolution {
+func resolveCursor(ctx context.Context, loader *configLoader, env Env, req ResolveRequest, displayName string, tr *tracer) Resolution {
 	// No form: Cursor's beforeMCPExecution reports the configuration key verbatim,
 	// so only an exact match means anything. Probed on Cursor 3.13.25 against nine
 	// deliberately awkward keys — mixed case, dots, an at-sign, a space, leading and
 	// trailing hyphens — and every one came back byte-identical. This event names the
 	// server; it does not build a tool namespace.
 	names := lookup{names: cursorLookupNames(displayName)}
-	m, out := resolveScopes(cursorScopes(env, req), names, tr)
+	m, out := resolveScopes(ctx, cursorScopes(loader, env, req), names, tr)
 	switch out {
 	case outcomeFound:
 		// The matched key, not the display name: Cursor's display name can carry a
@@ -43,10 +44,10 @@ func resolveCursor(env Env, req ResolveRequest, displayName string, tr *tracer) 
 // would be a self-service bypass: shadow an allowlisted project server's name in
 // user scope, call the user-scope one, and the allowlisted identity is what gets
 // reported and permitted.
-func cursorScopes(env Env, req ResolveRequest) []scope {
+func cursorScopes(loader *configLoader, env Env, req ResolveRequest) []scope {
 	paths := make([]string, 0, len(req.WorkspaceRoots)+1)
 	for _, root := range req.WorkspaceRoots {
-		if root = strings.TrimSpace(root); root != "" {
+		if root = strings.TrimSpace(root); filepath.IsAbs(root) {
 			paths = append(paths, filepath.Join(filepath.Clean(root), ".cursor", "mcp.json"))
 		}
 	}
@@ -59,7 +60,7 @@ func cursorScopes(env Env, req ResolveRequest) []scope {
 			continue
 		}
 		seen[path] = struct{}{}
-		scopes = append(scopes, scope{path: path, key: mcpServersKey, load: jsonServers(path)})
+		scopes = append(scopes, scope{path: path, key: mcpServersKey, load: jsonServers(loader, path)})
 	}
 	return scopes
 }

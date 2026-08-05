@@ -92,3 +92,14 @@ func targetUserFromAccount(u *user.User) (*TargetUser, error) {
 	}
 	return &TargetUser{Username: u.Username, HomeDir: u.HomeDir, UID: uid, GID: gid}, nil
 }
+
+func validateExecutableOwner(path string, info os.FileInfo) error {
+	st, ok := info.Sys().(*syscall.Stat_t)
+	if !ok || st == nil {
+		return fmt.Errorf("cannot read obot-sentry executable %q ownership", path)
+	}
+	if st.Uid != 0 {
+		return fmt.Errorf("obot-sentry executable %q is owned by uid %d, not root", path, st.Uid)
+	}
+	return nil
+}

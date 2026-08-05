@@ -1,6 +1,7 @@
 package enforce
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"maps"
@@ -18,6 +19,11 @@ const (
 // serverSet is a decoded MCP servers table, keyed as its file spells the names.
 type serverSet map[string]mcpEntry
 
+type cachedServerSet struct {
+	set serverSet
+	res loadResult
+}
+
 // scope is one place an agent can declare an MCP server.
 type scope struct {
 	// path and key name the source, for the trace.
@@ -28,7 +34,7 @@ type scope struct {
 	// closed marks a scope whose server set the agent treats as exclusive, so a
 	// miss here ends resolution instead of falling through to lower ranks.
 	closed bool
-	load   func() (serverSet, loadResult)
+	load   func(context.Context) (serverSet, loadResult)
 }
 
 func (s scope) traceKey(matched string) string {
@@ -101,7 +107,7 @@ type match struct {
 // Rank is the whole of precedence, so scopes sharing a rank are peers: nothing
 // orders them, and a name they define differently is ambiguous rather than settled
 // by search order.
-func resolveScopes(scopes []scope, names lookup, tr *tracer) (match, outcome) {
+func resolveScopes(ctx context.Context, scopes []scope, names lookup, tr *tracer) (match, outcome) {
 	for i := 0; i < len(scopes); {
 		var (
 			peers  []match
@@ -110,7 +116,7 @@ func resolveScopes(scopes []scope, names lookup, tr *tracer) (match, outcome) {
 		j := i
 		for ; j < len(scopes) && scopes[j].rank == scopes[i].rank; j++ {
 			s := scopes[j]
-			set, res := s.load()
+			set, res := s.load(ctx)
 			if res != loadOK {
 				tr.miss(s.path, s.traceKey(""), res)
 				continue
@@ -153,7 +159,7 @@ func agree(peers []match) (match, bool) {
 }
 
 func sameEntry(a, b mcpEntry) bool {
-	return a.URL == b.URL && a.Command == b.Command && slices.Equal(a.Args, b.Args)
+	return a.URL == b.URL && a.Command == b.Command && slices.Equal(a.Args, b.Args) && maps.Equal(a.Environment, b.Environment)
 }
 
 func ambiguous(agent localagent.Agent, name string) Resolution {
@@ -175,33 +181,58 @@ func ambiguousToolName(agent localagent.Agent, reported string, candidates []str
 		agent.DisplayName(), strings.Join(candidates, ", ")))
 }
 
-func jsonServers(path string) func() (serverSet, loadResult) {
-	return func() (serverSet, loadResult) {
+func jsonServers(loader *configLoader, path string) func(context.Context) (serverSet, loadResult) {
+	return func(ctx context.Context) (serverSet, loadResult) {
+		if ctx.Err() != nil {
+			return nil, loadUnusable
+		}
+		if cached, ok := loader.jsonServerSets[path]; ok {
+			return cached.set, cached.res
+		}
 		var doc struct {
 			MCPServers map[string]json.RawMessage `json:"mcpServers"`
 		}
-		if res := loadJSON(path, &doc); res != loadOK {
+		res := loader.loadJSON(ctx, path, &doc)
+		if ctx.Err() != nil {
+			return nil, loadUnusable
+		}
+		if res != loadOK {
+			loader.jsonServerSets[path] = cachedServerSet{res: res}
 			return nil, res
 		}
-		return decodeServers(doc.MCPServers), loadOK
+		set := decodeServers(doc.MCPServers)
+		loader.jsonServerSets[path] = cachedServerSet{set: set, res: loadOK}
+		return set, loadOK
 	}
 }
 
-func codexServers(path string) func() (serverSet, loadResult) {
-	return func() (serverSet, loadResult) {
+func codexServers(loader *configLoader, path string) func(context.Context) (serverSet, loadResult) {
+	return func(ctx context.Context) (serverSet, loadResult) {
+		if ctx.Err() != nil {
+			return nil, loadUnusable
+		}
+		if cached, ok := loader.codexServerSets[path]; ok {
+			return cached.set, cached.res
+		}
 		var doc struct {
 			MCPServers serverSet `toml:"mcp_servers"`
 		}
-		if res := loadTOML(path, &doc); res != loadOK {
+		res := loader.loadTOML(ctx, path, &doc)
+		if ctx.Err() != nil {
+			return nil, loadUnusable
+		}
+		if res != loadOK {
+			loader.codexServerSets[path] = cachedServerSet{res: res}
 			return nil, res
 		}
+		loader.codexServerSets[path] = cachedServerSet{set: doc.MCPServers, res: loadOK}
 		return doc.MCPServers, loadOK
 	}
 }
 
 // fixedServers serves an already-decoded table, for scopes that share one file.
-func fixedServers(set serverSet, res loadResult) func() (serverSet, loadResult) {
-	return func() (serverSet, loadResult) { return set, res }
+func fixedServers(set serverSet, res loadResult) func(context.Context) (serverSet, loadResult) {
+	return func(context.Context) (serverSet, loadResult) { return set, res }
 }
 
 // decodeServers decodes each entry on its own so one malformed sibling cannot cost

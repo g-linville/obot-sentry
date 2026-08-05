@@ -38,6 +38,16 @@ func TestCursorFileOrder(t *testing.T) {
 	}
 }
 
+func TestCursorIgnoresRelativeWorkspaceRoots(t *testing.T) {
+	f := newFixture(t, "darwin")
+	res := Resolve(f.Env, cursorReq("linear", filepath.Join("relative", "workspace")))
+
+	want := []string{f.homePath(".cursor", "mcp.json")}
+	if got := consultedPaths(res); !slices.Equal(got, want) {
+		t.Fatalf("consulted\n%v\nwant\n%v", got, want)
+	}
+}
+
 func TestCursorHTTPServerResolvesThroughTheLookup(t *testing.T) {
 	f := newFixture(t, "darwin")
 	ws := f.mkdir(f.path("ws"))
@@ -150,6 +160,20 @@ func TestCursorCollidingNameIsUnresolved(t *testing.T) {
 	if !slices.Equal(matched, []string{project, user}) {
 		t.Errorf("matched steps = %v, want both scopes\n%s", matched, resolveTrace(res))
 	}
+}
+
+func TestCursorCollidingNameWithDifferentEnvironmentIsUnresolved(t *testing.T) {
+	f := newFixture(t, "darwin")
+	ws := f.mkdir(f.path("ws"))
+	f.write(filepath.Join(ws, ".cursor", "mcp.json"), `{"mcpServers":{
+		"linear":{"command":"npx","args":["linear-mcp"],"env":{"LINEAR_TOKEN":"project-token"}}
+	}}`)
+	f.write(f.homePath(".cursor", "mcp.json"), `{"mcpServers":{
+		"linear":{"command":"npx","args":["linear-mcp"],"env":{"LINEAR_TOKEN":"user-token"}}
+	}}`)
+
+	res := Resolve(f.Env, cursorReq("linear", ws))
+	assertUnresolved(t, res, "conflicting definitions in more than one Cursor configuration scope")
 }
 
 // TestCursorSingleScopeResolves is the other half of the collision rule: a

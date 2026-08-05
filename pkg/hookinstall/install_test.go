@@ -382,3 +382,42 @@ func assertNoSecrets(t *testing.T, out string) {
 		}
 	}
 }
+
+func TestCommitRefusesConcurrentConfigEdit(t *testing.T) {
+	home := t.TempDir()
+	user := &TargetUser{Username: "alice", HomeDir: home, UID: os.Getuid(), GID: os.Getgid()}
+	dest := Destination{
+		Agent:  localagent.ClaudeCode,
+		Label:  "Claude Code",
+		Scope:  ScopeUser,
+		Format: FormatJSON,
+		Rel:    ".claude/settings.json",
+	}
+	abs, err := dest.ResolvePath(user)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(abs), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(abs, []byte("{}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	plan := Plan{GOOS: "darwin", Executable: macExe, User: user, Destinations: []Destination{dest}}
+	changes, err := buildChanges(t.Context(), plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const concurrent = `{"user":"edit"}`
+	if err := os.WriteFile(abs, []byte(concurrent), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	results := commitChanges(t.Context(), plan, changes)
+	if len(results) != 1 || results[0].Status != StatusFailed || results[0].Err == nil || !strings.Contains(results[0].Err.Error(), "changed after preflight") {
+		t.Fatalf("results = %+v, want a concurrent-edit failure", results)
+	}
+	if got, err := os.ReadFile(abs); err != nil || string(got) != concurrent {
+		t.Fatalf("concurrent edit was overwritten: got=%q err=%v", got, err)
+	}
+}

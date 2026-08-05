@@ -219,6 +219,32 @@ func TestRefusesEscapingIntermediateSymlink(t *testing.T) {
 	}
 }
 
+func TestUserConfigRefusesRootContainedIntermediateSymlink(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink creation requires privilege on Windows")
+	}
+	home := t.TempDir()
+	u := testUser(home)
+	actual := filepath.Join(home, "actual-copilot")
+	if err := os.MkdirAll(filepath.Join(actual, "hooks"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("actual-copilot", filepath.Join(home, ".copilot")); err != nil {
+		t.Fatal(err)
+	}
+	abs := filepath.Join(home, ".copilot", "hooks", "obot-sentry.json")
+
+	if _, _, err := readConfigFile(ScopeUser, home, abs); err == nil {
+		t.Fatal("read followed a user-scope intermediate symlink")
+	}
+	if err := commitConfigFile(ScopeUser, u, abs, []byte("managed")); err == nil {
+		t.Fatal("commit followed a user-scope intermediate symlink")
+	}
+	if _, err := os.Lstat(filepath.Join(actual, "hooks", "obot-sentry.json")); !os.IsNotExist(err) {
+		t.Fatalf("symlink target was changed: %v", err)
+	}
+}
+
 func TestReadRefusesPathEscapingHome(t *testing.T) {
 	home := t.TempDir()
 	outside := filepath.Join(filepath.Dir(home), "elsewhere.json")
@@ -264,15 +290,22 @@ func TestRelWithinRejectsEscape(t *testing.T) {
 }
 
 func TestRootForMachineUsesVolumeRoot(t *testing.T) {
-	rootDir, rel, err := rootFor(ScopeMachine, "", filepath.FromSlash("/etc/codex/requirements.toml"))
+	// The path has to be one this host would install to: Windows requires a local
+	// drive-letter volume, which the /etc location Codex uses on macOS has none of.
+	abs := filepath.FromSlash("/etc/codex/requirements.toml")
+	if runtime.GOOS == "windows" {
+		abs = filepath.Join(windowsProgramData(), "OpenAI", "Codex", "requirements.toml")
+	}
+
+	rootDir, rel, err := rootFor(ScopeMachine, "", abs)
 	if err != nil {
 		t.Fatal(err)
 	}
-	wantRoot := filepath.VolumeName(filepath.FromSlash("/etc/codex/requirements.toml")) + string(filepath.Separator)
+	wantRoot := filepath.VolumeName(abs) + string(filepath.Separator)
 	if rootDir != wantRoot {
 		t.Fatalf("machine root = %q, want %q", rootDir, wantRoot)
 	}
-	if filepath.Join(rootDir, rel) != filepath.Clean(filepath.FromSlash("/etc/codex/requirements.toml")) {
-		t.Fatalf("root+rel = %q", filepath.Join(rootDir, rel))
+	if filepath.Join(rootDir, rel) != filepath.Clean(abs) {
+		t.Fatalf("root+rel = %q, want %q", filepath.Join(rootDir, rel), filepath.Clean(abs))
 	}
 }

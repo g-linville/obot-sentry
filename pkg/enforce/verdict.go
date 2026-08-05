@@ -15,18 +15,6 @@ type Denial struct {
 	AgentMessage string
 }
 
-// DenialContext names the call that was blocked.
-type DenialContext struct {
-	Tool       string
-	ServerName string
-	Server     string
-}
-
-const (
-	outcomeRefusedByPolicy  = "refused-by-policy"
-	outcomeRefusedUnchecked = "refused-unchecked"
-)
-
 const agentGuardrails = `Tell the user their organization blocked this call, then stop and wait for them — and state it as a fact, because whether the policy is right about this particular call is not decidable from here.
 
 Do not attempt the same result by any other route (another tool, another server, a shell command), and do not open, summarize, or propose edits to hook definitions, settings files, or MCP server configuration: the policy is not stored on this device, so nothing changed here decides anything.`
@@ -35,56 +23,44 @@ Do not attempt the same result by any other route (another tool, another server,
 // string that has to be readable as a notification and still instruct the model.
 const shortGuardrails = "Do not try again, and do not change any hook or MCP configuration."
 
-// maxReasonRunes bounds a reason string in a denial. Reasons arrive from
-// outside: Obot writes the policy ones, and an infrastructure one is whatever
-// error text a transport, a proxy, or a non-2xx body produced — a 404 from a
-// reverse proxy is an entire HTML page. Unbounded, that lands in the model's
-// context verbatim and buries the instructions after it.
+// maxReasonRunes bounds the internal diagnostic retained in Result and shown by
+// an explicit dry run. Denial protocol responses and ordinary hook stderr never
+// include the reason.
 const maxReasonRunes = 240
 
 type denialOutcome struct {
-	name    string
 	summary string
 	footer  string
 }
 
 var (
 	refusedByPolicy = denialOutcome{
-		name:    outcomeRefusedByPolicy,
 		summary: "Obot checked this call against your organization's tool policy and the policy refused it. The call did not run.",
 		footer:  "Ask your Obot administrator to review the tool allowlist if this call should be permitted.",
 	}
 	refusedUnchecked = denialOutcome{
-		name:    outcomeRefusedUnchecked,
 		summary: "Obot could not reach a verdict on this call — the tool policy was never checked — so the call was refused unchecked and did not run. Nothing about it was found to be prohibited.",
 		footer:  "Tell your Obot administrator if this recurs.",
 	}
 )
 
-func PolicyDenial(reason string, ctx DenialContext) Denial {
-	blocked := "this action is not permitted by your organization's tool policy"
-	if ctx.ServerName != "" {
-		blocked = fmt.Sprintf("MCP server %q is not permitted by your organization's tool policy", ctx.ServerName)
-	}
+func PolicyDenial() Denial {
 	return Denial{
-		UserMessage:  fmt.Sprintf("Blocked: %s. %s Your Obot administrator can add it to the tool allowlist.", blocked, shortGuardrails),
-		AgentMessage: violation(refusedByPolicy, reason, ctx),
+		UserMessage:  fmt.Sprintf("Blocked: this action is not permitted by your organization's tool policy. %s Your Obot administrator can review the tool allowlist.", shortGuardrails),
+		AgentMessage: violation(refusedByPolicy),
 	}
 }
 
-func InfrastructureDenial(reason string, ctx DenialContext) Denial {
+func InfrastructureDenial() Denial {
 	return Denial{
 		UserMessage: fmt.Sprintf(
 			"Blocked: your organization's tool policy could not be checked, so this action was refused. %s Report it to your Obot administrator if it persists.",
 			shortGuardrails),
-		AgentMessage: violation(refusedUnchecked, reason, ctx),
+		AgentMessage: violation(refusedUnchecked),
 	}
 }
 
-// compactReason folds a reason onto one line and bounds its length, so it stays
-// one line in the block below rather than swallowing it. A reason is a label,
-// not a payload — see the note on deny() for where the rest of a server error
-// goes, which is nowhere.
+// compactReason folds a diagnostic onto one line and bounds its length.
 func compactReason(reason string) string {
 	reason = strings.Join(strings.Fields(reason), " ")
 	runes := []rune(reason)
@@ -102,38 +78,19 @@ var denialTmpl = template.Must(template.New("denial").Parse(denialTemplate))
 type denialView struct {
 	Summary    string
 	Guardrails string
-	Details    string
-	Reason     string
 	Footer     string
 }
 
-func violation(out denialOutcome, reason string, ctx DenialContext) string {
+func violation(out denialOutcome) string {
 	var b strings.Builder
 	if err := denialTmpl.Execute(&b, denialView{
 		Summary:    out.summary,
 		Guardrails: agentGuardrails,
-		Details:    detailLine(out, ctx),
-		Reason:     compactReason(reason),
 		Footer:     out.footer,
 	}); err != nil {
 		panic("enforce: rendering the denial block: " + err.Error())
 	}
 	return b.String()
-}
-
-func detailLine(out denialOutcome, ctx DenialContext) string {
-	parts := make([]string, 0, 4)
-	parts = append(parts, "outcome "+out.name)
-	if ctx.Tool != "" {
-		parts = append(parts, "call "+ctx.Tool)
-	}
-	if ctx.ServerName != "" {
-		parts = append(parts, "MCP server "+ctx.ServerName)
-	}
-	if ctx.Server != "" {
-		parts = append(parts, "resolved as "+ctx.Server)
-	}
-	return "Blocked: " + strings.Join(parts, "; ") + "."
 }
 
 // claudeHookOutput is the PreToolUse response shape Claude Code and Codex share.

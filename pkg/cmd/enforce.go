@@ -15,6 +15,7 @@ import (
 	"github.com/obot-platform/obot-sentry/pkg/enforce"
 	"github.com/obot-platform/obot-sentry/pkg/identity"
 	"github.com/obot-platform/obot-sentry/pkg/localagent"
+	"github.com/obot-platform/obot-sentry/pkg/mdmconfig"
 	"github.com/obot-platform/obot/apiclient/types"
 	"github.com/spf13/cobra"
 )
@@ -22,13 +23,20 @@ import (
 const enforceHookBudget = 5 * time.Second
 
 type Enforce struct {
-	ConfigFlags
-	Agent           string `usage:"local agent provider: claude-code, codex, cursor"`
-	Event           string `usage:"the agent's own pre-tool event: PreToolUse, beforeMCPExecution, preToolUse"`
-	Input           string `usage:"hook payload input path, or - for stdin" default:"-"`
-	ManagedBy       string `usage:"managed hook marker" name:"managed-by" hidden:"true"`
-	DryRun          bool   `usage:"normalize and resolve the call without asking for a verdict or answering the agent" name:"dry-run"`
-	PrintNormalized bool   `usage:"print the normalized decision request to stdout" name:"print-normalized"`
+	// These are deliberately hand-built flags rather than tagged command fields.
+	// The command builder gives every exported field an implicit environment
+	// binding, but an enforcement hook must consume the agent's stdin and make a
+	// real, protocol-clean decision regardless of the environment it inherits.
+	// Every value may still be supplied explicitly; installed hooks pin agent,
+	// event, and managed-by while diagnostics may opt into the others.
+	agent           string
+	event           string
+	managedBy       string
+	input           string
+	dryRun          bool
+	printNormalized bool
+	serverURL       string
+	loadMDMConfig   func() (mdmconfig.Config, error)
 }
 
 func newEnforceCommand() (*cobra.Command, *Enforce) {
@@ -43,6 +51,16 @@ func (e *Enforce) Customize(cmd *cobra.Command) {
 	cmd.Use = "enforce"
 	cmd.Short = "Decide a pre-tool hook payload against Obot's allowlist"
 	cmd.Hidden = true
+	cmd.Flags().StringVar(&e.agent, "agent", "", "local agent provider: claude-code, codex, cursor")
+	cmd.Flags().StringVar(&e.event, "event", "", "the agent's own pre-tool event: PreToolUse, beforeMCPExecution, preToolUse")
+	cmd.Flags().StringVar(&e.managedBy, "managed-by", "", "managed hook marker")
+	if err := cmd.Flags().MarkHidden("managed-by"); err != nil {
+		panic(err)
+	}
+	cmd.Flags().StringVar(&e.input, "input", "-", "hook payload input path, or - for stdin")
+	cmd.Flags().BoolVar(&e.dryRun, "dry-run", false, "normalize and resolve the call without asking for a verdict or answering the agent")
+	cmd.Flags().BoolVar(&e.printNormalized, "print-normalized", false, "print the normalized decision request to stdout")
+	cmd.Flags().StringVar(&e.serverURL, "server-url", "", "Obot server base URL (overrides the MDM-configured value)")
 
 	// Flag and argument errors have to fail closed as well. Cobra reports them
 	// before RunE, so no protocol response is written, and a plain error exits 2
@@ -63,11 +81,11 @@ func (e *Enforce) Run(cmd *cobra.Command, _ []string) error {
 	// hook-install recognizes when it converges its own hook entries. A foreign
 	// value is an invocation we do not understand, so it fails closed through the
 	// same blocking exit as a flag we cannot parse.
-	if e.ManagedBy != "" && e.ManagedBy != "obot-sentry" {
+	if e.managedBy != "" && e.managedBy != "obot-sentry" {
 		return &ExitCodeError{Code: 2, Err: errors.New("--managed-by must be empty or obot-sentry")}
 	}
 
-	input, closeInput, err := openEnforceInput(e.Input)
+	input, closeInput, err := openEnforceInput(e.input)
 	if err != nil {
 		// Fail closed with no protocol channel available: nothing about the
 		// invocation is usable yet, not even which agent is waiting on stdout.
@@ -82,19 +100,40 @@ func (e *Enforce) Run(cmd *cobra.Command, _ []string) error {
 
 	result := enforce.Run(ctx, enforce.Options{
 		Env:             env,
-		Agent:           e.Agent,
-		Event:           e.Event,
+		Agent:           e.agent,
+		Event:           e.event,
 		Input:           input,
 		Stdout:          cmd.OutOrStdout(),
 		Stderr:          cmd.ErrOrStderr(),
 		Decide:          e.decider(envErr),
-		PrintNormalized: e.PrintNormalized,
-		DryRun:          e.DryRun,
+		PrintNormalized: e.printNormalized,
+		DryRun:          e.dryRun,
 	})
 	if result.Unusable {
 		return &ExitCodeError{Code: 2, Err: errors.New(result.Reason)}
 	}
+	if result.ResponseWriteErr != nil {
+		return &ExitCodeError{Code: 2, Err: result.ResponseWriteErr}
+	}
 	return nil
+}
+
+// resolveConfig reads the protected MDM configuration and applies only an
+// explicit command-line override. Unlike the general ConfigFlags resolver it
+// has no environment-variable input.
+func (e *Enforce) resolveConfig() (mdmconfig.Config, error) {
+	load := e.loadMDMConfig
+	if load == nil {
+		load = mdmconfig.Load
+	}
+	cfg, err := load()
+	if err != nil {
+		return mdmconfig.Config{}, fmt.Errorf("reading MDM configuration: %w", err)
+	}
+	if e.serverURL != "" {
+		cfg.ServerURL = e.serverURL
+	}
+	return cfg, nil
 }
 
 // decider returns the call that asks Obot for a verdict. Every piece of setup it
@@ -112,7 +151,7 @@ func (e *Enforce) decider(envErr error) enforce.DecideFunc {
 		if envErr != nil {
 			return zero, fmt.Errorf("the machine environment could not be resolved: %w", envErr)
 		}
-		cfg, err := e.resolve()
+		cfg, err := e.resolveConfig()
 		if err != nil {
 			return zero, fmt.Errorf("the deployment configuration could not be read: %w", err)
 		}

@@ -3,10 +3,31 @@
 package hookinstall
 
 import (
+	"os"
 	"os/user"
+	"path/filepath"
 	"strings"
 	"testing"
 )
+
+func TestValidateExecutableOwnerRequiresRoot(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "obot-sentry")
+	if err := os.WriteFile(path, []byte("binary"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = validateExecutableOwner(path, info)
+	if os.Geteuid() == 0 {
+		if err != nil {
+			t.Fatalf("root-owned test executable was rejected: %v", err)
+		}
+	} else if err == nil || !strings.Contains(err.Error(), "not root") {
+		t.Fatalf("user-owned test executable was accepted: %v", err)
+	}
+}
 
 func TestTargetUserFromAccountAcceptsRealUser(t *testing.T) {
 	home := t.TempDir()

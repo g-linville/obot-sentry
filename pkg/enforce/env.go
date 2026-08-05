@@ -2,9 +2,11 @@ package enforce
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -23,6 +25,9 @@ type Env struct {
 	GOOS string
 	// Getenv resolves an environment variable. Nil falls back to os.Getenv.
 	Getenv func(string) string
+	// Environ returns the complete process environment for security checks that
+	// must recognize prefix families such as NPM_CONFIG_* and UV_*.
+	Environ func() []string
 	// MachineRoot is prepended to the fixed machine-scoped absolute paths — the
 	// macOS Claude Code managed MCP config and Codex's /etc config. It is empty
 	// in production and a fixture-tree root in tests. Machine paths that come
@@ -37,7 +42,10 @@ func NewEnv() (Env, error) {
 	if err != nil {
 		return Env{}, fmt.Errorf("resolve home dir: %w", err)
 	}
-	return Env{Home: home, GOOS: runtime.GOOS, Getenv: os.Getenv}, nil
+	if !filepath.IsAbs(home) {
+		return Env{}, fmt.Errorf("resolved home dir %q is not absolute", home)
+	}
+	return Env{Home: home, GOOS: runtime.GOOS, Getenv: os.Getenv, Environ: os.Environ}, nil
 }
 
 func (e Env) windows() bool { return e.GOOS == "windows" }
@@ -47,6 +55,13 @@ func (e Env) getenv(key string) string {
 		return os.Getenv(key)
 	}
 	return e.Getenv(key)
+}
+
+func (e Env) environ() []string {
+	if e.Environ == nil {
+		return nil
+	}
+	return e.Environ()
 }
 
 // homePath joins slash-separated elements onto the home directory.
@@ -63,11 +78,12 @@ func (e Env) machinePath(abs string) string {
 	return filepath.Join(e.MachineRoot, filepath.FromSlash(abs))
 }
 
-// envPath resolves a Windows machine path rooted at an environment variable,
-// falling back to the conventional location when the variable is unset.
+// envPath resolves a Windows machine path rooted at an absolute environment
+// variable, falling back to the conventional location when it is unset or
+// relative.
 func (e Env) envPath(key, fallback string, elem ...string) string {
 	base := e.getenv(key)
-	if base == "" {
+	if base == "" || !filepath.IsAbs(base) {
 		return filepath.Join(append([]string{e.machinePath(fallback)}, elem...)...)
 	}
 	return filepath.Join(append([]string{base}, elem...)...)
@@ -102,10 +118,51 @@ func (r loadResult) note() string {
 // unreadable, and an unreadable config is a deny.
 var utf8BOM = []byte{0xef, 0xbb, 0xbf}
 
-// readConfig reads path, refusing anything over maxConfigBytes and removing one
-// leading byte-order mark.
-func readConfig(path string) ([]byte, loadResult) {
-	f, err := os.Open(path)
+type cachedConfig struct {
+	data []byte
+	res  loadResult
+}
+
+// configLoader caches one stable snapshot per path. It bounds and reads each
+// path once, so ambiguous tool-name resolution cannot amplify one payload into
+// repeated filesystem I/O. Operation lifetime belongs to the contexts passed
+// to its methods, not to the cache itself.
+type configLoader struct {
+	files           map[string]cachedConfig
+	jsonServerSets  map[string]cachedServerSet
+	codexServerSets map[string]cachedServerSet
+	claudeDocs      map[string]cachedClaudeJSON
+}
+
+func newConfigLoader() *configLoader {
+	return &configLoader{
+		files:           map[string]cachedConfig{},
+		jsonServerSets:  map[string]cachedServerSet{},
+		codexServerSets: map[string]cachedServerSet{},
+		claudeDocs:      map[string]cachedClaudeJSON{},
+	}
+}
+
+func (l *configLoader) readConfig(ctx context.Context, path string) ([]byte, loadResult) {
+	if err := ctx.Err(); err != nil {
+		return nil, loadUnusable
+	}
+	if cached, ok := l.files[path]; ok {
+		return cached.data, cached.res
+	}
+	data, res := l.readConfigUncached(ctx, path)
+	if ctx.Err() != nil {
+		return nil, loadUnusable
+	}
+	l.files[path] = cachedConfig{data: data, res: res}
+	return data, res
+}
+
+func (l *configLoader) readConfigUncached(ctx context.Context, path string) ([]byte, loadResult) {
+	if err := ctx.Err(); err != nil {
+		return nil, loadUnusable
+	}
+	f, err := openConfigFile(path)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			return nil, loadAbsent
@@ -113,16 +170,24 @@ func readConfig(path string) ([]byte, loadResult) {
 		return nil, loadUnusable
 	}
 	defer func() { _ = f.Close() }()
+	stopClose := context.AfterFunc(ctx, func() { _ = f.Close() })
+	defer stopClose()
 
 	info, err := f.Stat()
 	if err != nil {
 		return nil, loadUnusable
 	}
-	if info.IsDir() || info.Size() > maxConfigBytes {
+	if !info.Mode().IsRegular() || info.Size() > maxConfigBytes {
 		return nil, loadUnusable
 	}
-	data, err := os.ReadFile(path)
+	data, err := io.ReadAll(io.LimitReader(f, maxConfigBytes+1))
 	if err != nil {
+		return nil, loadUnusable
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, loadUnusable
+	}
+	if len(data) > maxConfigBytes {
 		return nil, loadUnusable
 	}
 	return bytes.TrimPrefix(data, utf8BOM), loadOK
@@ -136,30 +201,48 @@ func readConfig(path string) ([]byte, loadResult) {
 // we refuse to parse becomes an unresolved call, and an unresolved call is
 // denied.
 func loadJSON(path string, out any) loadResult {
-	data, res := readConfig(path)
+	return newConfigLoader().loadJSON(context.Background(), path, out)
+}
+
+func (l *configLoader) loadJSON(ctx context.Context, path string, out any) loadResult {
+	data, res := l.readConfig(ctx, path)
 	if res != loadOK {
 		return res
 	}
 	if err := json.Unmarshal(data, out); err == nil {
+		if ctx.Err() != nil {
+			return loadUnusable
+		}
 		return loadOK
+	}
+	if ctx.Err() != nil {
+		return loadUnusable
 	}
 	standard, err := hujson.Standardize(data)
 	if err != nil {
 		return loadUnusable
 	}
+	if ctx.Err() != nil {
+		return loadUnusable
+	}
 	if err := json.Unmarshal(standard, out); err != nil {
+		return loadUnusable
+	}
+	if ctx.Err() != nil {
 		return loadUnusable
 	}
 	return loadOK
 }
 
-// loadTOML decodes the TOML file at path into out.
-func loadTOML(path string, out any) loadResult {
-	data, res := readConfig(path)
+func (l *configLoader) loadTOML(ctx context.Context, path string, out any) loadResult {
+	data, res := l.readConfig(ctx, path)
 	if res != loadOK {
 		return res
 	}
 	if _, err := toml.Decode(string(data), out); err != nil {
+		return loadUnusable
+	}
+	if ctx.Err() != nil {
 		return loadUnusable
 	}
 	return loadOK

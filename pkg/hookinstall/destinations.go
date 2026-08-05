@@ -2,7 +2,6 @@ package hookinstall
 
 import (
 	"fmt"
-	"os"
 	"path/filepath"
 	"strings"
 
@@ -34,17 +33,6 @@ func (d Destination) ResolvePath(u *TargetUser) (string, error) {
 	default:
 		return "", fmt.Errorf("destination %q has unknown scope %q", d.Label, d.Scope)
 	}
-}
-
-// windowsProgramData resolves the machine configuration root used by Codex and
-// Cursor on Windows, falling back to the conventional path when the environment
-// variable is unset (for example when modeling Windows destinations from a test
-// on another OS).
-func windowsProgramData() string {
-	if pd := os.Getenv("ProgramData"); pd != "" {
-		return pd
-	}
-	return `C:\ProgramData`
 }
 
 // winJoin joins Windows path components with backslashes, trimming any trailing

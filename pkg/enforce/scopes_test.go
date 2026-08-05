@@ -1,6 +1,7 @@
 package enforce
 
 import (
+	"context"
 	"slices"
 	"testing"
 )
@@ -25,7 +26,7 @@ func TestResolveScopesRankOrder(t *testing.T) {
 		fixedScope("low", 1, urlSet("linear", "https://low.example.com/sse")),
 	}
 
-	m, out := resolveScopes(scopes, exactly("linear"), &tracer{})
+	m, out := resolveScopes(t.Context(), scopes, exactly("linear"), &tracer{})
 	if out != outcomeFound {
 		t.Fatalf("outcome = %v, want outcomeFound", out)
 	}
@@ -41,13 +42,13 @@ func TestResolveScopesStopsAtTheFirstRankThatMatches(t *testing.T) {
 	loaded := false
 	scopes := []scope{
 		fixedScope("high", 0, urlSet("linear", "https://high.example.com/sse")),
-		{path: "low", key: mcpServersKey, rank: 1, load: func() (serverSet, loadResult) {
+		{path: "low", key: mcpServersKey, rank: 1, load: func(context.Context) (serverSet, loadResult) {
 			loaded = true
 			return urlSet("linear", "https://low.example.com/sse"), loadOK
 		}},
 	}
 
-	if _, out := resolveScopes(scopes, exactly("linear"), &tracer{}); out != outcomeFound {
+	if _, out := resolveScopes(t.Context(), scopes, exactly("linear"), &tracer{}); out != outcomeFound {
 		t.Fatalf("outcome = %v, want outcomeFound", out)
 	}
 	if loaded {
@@ -58,7 +59,7 @@ func TestResolveScopesStopsAtTheFirstRankThatMatches(t *testing.T) {
 func TestResolveScopesMiss(t *testing.T) {
 	scopes := []scope{fixedScope("only", 0, urlSet("github", "https://github.example.com/sse"))}
 
-	if _, out := resolveScopes(scopes, exactly("linear"), &tracer{}); out != outcomeMiss {
+	if _, out := resolveScopes(t.Context(), scopes, exactly("linear"), &tracer{}); out != outcomeMiss {
 		t.Fatalf("outcome = %v, want outcomeMiss", out)
 	}
 }
@@ -72,7 +73,7 @@ func TestResolveScopesPeersThatConflict(t *testing.T) {
 		fixedScope("b", 0, urlSet("linear", "https://b.example.com/sse")),
 	}
 
-	if _, out := resolveScopes(scopes, exactly("linear"), &tracer{}); out != outcomeAmbiguous {
+	if _, out := resolveScopes(t.Context(), scopes, exactly("linear"), &tracer{}); out != outcomeAmbiguous {
 		t.Fatalf("outcome = %v, want outcomeAmbiguous", out)
 	}
 }
@@ -86,12 +87,32 @@ func TestResolveScopesPeersThatAgree(t *testing.T) {
 		fixedScope("b", 0, serverSet{"linear": {Command: "npx", Args: []string{"-y", "linear-mcp"}}}),
 	}
 
-	m, out := resolveScopes(scopes, exactly("linear"), &tracer{})
+	m, out := resolveScopes(t.Context(), scopes, exactly("linear"), &tracer{})
 	if out != outcomeFound {
 		t.Fatalf("outcome = %v, want outcomeFound", out)
 	}
 	if !slices.Equal(m.entry.Args, []string{"-y", "linear-mcp"}) {
 		t.Fatalf("entry = %+v", m.entry)
+	}
+}
+
+func TestResolveScopesPeersWithDifferentEnvironmentConflict(t *testing.T) {
+	base := mcpEntry{
+		Command: "npx",
+		Args:    []string{"-y", "linear-mcp"},
+		Environment: map[string]string{
+			"LINEAR_TOKEN": "project-token",
+		},
+	}
+	shadow := base
+	shadow.Environment = map[string]string{"LINEAR_TOKEN": "user-token"}
+	scopes := []scope{
+		fixedScope("project", 0, serverSet{"linear": base}),
+		fixedScope("user", 0, serverSet{"linear": shadow}),
+	}
+
+	if _, out := resolveScopes(t.Context(), scopes, exactly("linear"), &tracer{}); out != outcomeAmbiguous {
+		t.Fatalf("outcome = %v, want outcomeAmbiguous for definitions that differ by environment", out)
 	}
 }
 
@@ -104,7 +125,7 @@ func TestResolveScopesPeersRecordEveryMatch(t *testing.T) {
 	}
 
 	tr := &tracer{}
-	resolveScopes(scopes, exactly("linear"), tr)
+	resolveScopes(t.Context(), scopes, exactly("linear"), tr)
 
 	var matched []string
 	for _, step := range tr.steps {
@@ -124,7 +145,7 @@ func TestResolveScopesClosedScope(t *testing.T) {
 	managed.closed = true
 	scopes := []scope{managed, fixedScope("user", 1, urlSet("linear", "https://user.example.com/sse"))}
 
-	if _, out := resolveScopes(scopes, exactly("linear"), &tracer{}); out != outcomeClosed {
+	if _, out := resolveScopes(t.Context(), scopes, exactly("linear"), &tracer{}); out != outcomeClosed {
 		t.Fatalf("outcome = %v, want outcomeClosed", out)
 	}
 }
@@ -137,7 +158,7 @@ func TestResolveScopesClosedScopeThatIsAbsent(t *testing.T) {
 		fixedScope("user", 1, urlSet("linear", "https://user.example.com/sse")),
 	}
 
-	m, out := resolveScopes(scopes, exactly("linear"), &tracer{})
+	m, out := resolveScopes(t.Context(), scopes, exactly("linear"), &tracer{})
 	if out != outcomeFound {
 		t.Fatalf("outcome = %v, want outcomeFound", out)
 	}
@@ -215,7 +236,7 @@ func TestDecodeServersKeepsMalformedSiblings(t *testing.T) {
 		"linear": {"url":"https://linear.example.com/sse"}
 	}}`)
 
-	set, res := jsonServers(path)()
+	set, res := jsonServers(newConfigLoader(), path)(t.Context())
 	if res != loadOK {
 		t.Fatalf("load = %v, want loadOK", res)
 	}

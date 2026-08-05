@@ -35,6 +35,9 @@ type Result struct {
 	Response []byte
 	Denied   bool
 	Reason   string
+	// ResponseWriteErr reports that the agent did not receive the rendered
+	// verdict. The command layer turns this into the protocol's blocking exit.
+	ResponseWriteErr error
 
 	// Requested reports whether a decision request was issued. Every path issues
 	// exactly one, except a Cursor preToolUse call on an MCP-shaped name.
@@ -67,13 +70,15 @@ func Run(ctx context.Context, opts Options) Result {
 	}
 
 	if result.Denied {
-		warn(opts.Stderr, "obot-sentry enforce: blocked: %s", result.Reason)
+		warn(opts.Stderr, "obot-sentry enforce: blocked")
 	}
 	if len(result.Response) > 0 {
-		if _, err := opts.Stdout.Write(result.Response); err != nil {
-			// The agent will not have received the verdict. Nothing further can be
-			// done here; a Cursor hook fails closed on a missing response, and the
-			// other two fall back to their own permission flow.
+		n, err := opts.Stdout.Write(result.Response)
+		if err == nil && n != len(result.Response) {
+			err = io.ErrShortWrite
+		}
+		if err != nil {
+			result.ResponseWriteErr = fmt.Errorf("writing the hook response: %w", err)
 			warn(opts.Stderr, "obot-sentry enforce: writing the hook response: %v", err)
 		}
 	}
@@ -106,7 +111,7 @@ func evaluate(ctx context.Context, opts Options) Result {
 
 	event, err := ParseEvent(agent, opts.Event)
 	if err != nil {
-		return deny(agent, Events(agent)[0], Result{}, err.Error(), InfrastructureDenial(err.Error(), DenialContext{}))
+		return deny(agent, Events(agent)[0], Result{}, err.Error(), InfrastructureDenial())
 	}
 
 	raw, err := readPayload(opts.Input)
@@ -114,7 +119,7 @@ func evaluate(ctx context.Context, opts Options) Result {
 		return infrastructureDeny(agent, event, Result{}, fmt.Sprintf("the hook payload could not be read: %v", err))
 	}
 
-	call, err := normalizeCall(opts.Env, agent, event, raw)
+	call, err := normalizeCallContext(ctx, opts.Env, agent, event, raw)
 	if err != nil {
 		return infrastructureDeny(agent, event, Result{}, err.Error())
 	}
@@ -156,7 +161,7 @@ func evaluate(ctx context.Context, opts Options) Result {
 		if reason == "" {
 			reason = "the call is not permitted by your organization's tool policy"
 		}
-		return deny(agent, event, result, reason, PolicyDenial(reason, denialContext(call)))
+		return deny(agent, event, result, reason, PolicyDenial())
 	default:
 		// Neither an allow nor a deny. A zero-valued response decodes to an empty
 		// decision, so anything unrecognized has to block rather than read as
@@ -170,34 +175,17 @@ func evaluate(ctx context.Context, opts Options) Result {
 // payload that could not be read, a policy that could not be checked, an answer
 // that could not be understood.
 func infrastructureDeny(agent localagent.Agent, event Event, result Result, reason string) Result {
-	return deny(agent, event, result, reason, InfrastructureDenial(reason, denialContextOf(result.Request)))
+	return deny(agent, event, result, reason, InfrastructureDenial())
 }
 
-// deny records the block. The reason is compacted here as well as in the
-// messages it renders, because it also reaches the hook's stderr — and an
-// unbounded one is a real hazard there too: a non-2xx body can be half a
-// megabyte of HTML, and Claude Code surfaces hook stderr into the transcript.
-// Nothing on the device keeps the untruncated text; for a transport failure the
-// status and the first line of the body are the diagnosis, and for a policy deny
-// the decision log has the row.
+// deny records the block. The reason remains available to the command for exit
+// handling and to an explicit dry run, but neither the protocol response nor
+// ordinary hook stderr renders it.
 func deny(agent localagent.Agent, event Event, result Result, reason string, denial Denial) Result {
 	result.Denied = true
 	result.Reason = compactReason(reason)
 	result.Response = Deny(agent, event, denial)
 	return result
-}
-
-// denialContext describes the blocked call to the model, including how the
-// target server was resolved — an administrator reading the same row in the
-// decision log sees the same identity.
-func denialContext(call Call) DenialContext {
-	ctx := denialContextOf(call.Request)
-	ctx.Server = Resolution{Identity: call.Request.Server}.String()
-	return ctx
-}
-
-func denialContextOf(req types.EnforcementDecisionRequest) DenialContext {
-	return DenialContext{Tool: req.Tool, ServerName: req.ServerName}
 }
 
 // readPayload reads at most maxPayloadBytes from the hook's input. A nil input

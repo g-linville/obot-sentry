@@ -5,6 +5,8 @@ package hookinstall
 import (
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
@@ -75,6 +77,34 @@ func isSystemToken(token windows.Token) bool {
 		return false
 	}
 	return user.User.Sid.Equals(systemSID)
+}
+
+func validateExecutableOwner(path string, _ os.FileInfo) error {
+	// Resolve symlinks and reparse points throughout the path before querying
+	// security information, so ownership is checked on the final target.
+	target, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return fmt.Errorf("resolving obot-sentry executable %q: %w", path, err)
+	}
+	sd, err := windows.GetNamedSecurityInfo(target, windows.SE_FILE_OBJECT, windows.OWNER_SECURITY_INFORMATION)
+	if err != nil {
+		return fmt.Errorf("reading obot-sentry executable %q owner: %w", target, err)
+	}
+	if sd == nil {
+		return fmt.Errorf("obot-sentry executable %q has no security descriptor", target)
+	}
+	owner, _, err := sd.Owner()
+	if err != nil {
+		return fmt.Errorf("reading obot-sentry executable %q owner: %w", target, err)
+	}
+	if !trustedExecutableOwner(owner) {
+		return fmt.Errorf("obot-sentry executable %q is not owned by SYSTEM or Administrators", target)
+	}
+	return nil
+}
+
+func trustedExecutableOwner(owner *windows.SID) bool {
+	return owner != nil && (owner.IsWellKnown(windows.WinLocalSystemSid) || owner.IsWellKnown(windows.WinBuiltinAdministratorsSid))
 }
 
 // resolveTargetUser resolves the active console user on Windows. A SYSTEM

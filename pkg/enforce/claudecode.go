@@ -1,6 +1,7 @@
 package enforce
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -32,6 +33,27 @@ type claudeJSON struct {
 	ClaudeAIMCPEverConnected []string `json:"claudeAiMcpEverConnected"`
 }
 
+type cachedClaudeJSON struct {
+	doc claudeJSON
+	res loadResult
+}
+
+func (l *configLoader) loadClaudeJSON(ctx context.Context, path string) (claudeJSON, loadResult) {
+	if ctx.Err() != nil {
+		return claudeJSON{}, loadUnusable
+	}
+	if cached, ok := l.claudeDocs[path]; ok {
+		return cached.doc, cached.res
+	}
+	var doc claudeJSON
+	res := l.loadJSON(ctx, path, &doc)
+	if ctx.Err() != nil {
+		return claudeJSON{}, loadUnusable
+	}
+	l.claudeDocs[path] = cachedClaudeJSON{doc: doc, res: res}
+	return doc, res
+}
+
 // managedMCPPath returns the enterprise managed MCP configuration path.
 func (e Env) managedMCPPath() string {
 	if e.windows() {
@@ -42,10 +64,9 @@ func (e Env) managedMCPPath() string {
 
 // resolveClaudeCode resolves a Claude Code server name against its MCP
 // configuration, then against the claude.ai account connectors.
-func resolveClaudeCode(env Env, req ResolveRequest, serverName string, tr *tracer) Resolution {
+func resolveClaudeCode(ctx context.Context, loader *configLoader, env Env, req ResolveRequest, serverName string, tr *tracer) Resolution {
 	claudePath := env.homePath(".claude.json")
-	var claude claudeJSON
-	claudeRes := loadJSON(claudePath, &claude)
+	claude, claudeRes := loader.loadClaudeJSON(ctx, claudePath)
 
 	// Most Claude Code keys survive namespacing untouched — hyphens and underscores
 	// are legal in a tool namespace — so most lookups here match exactly. A key
@@ -55,7 +76,7 @@ func resolveClaudeCode(env Env, req ResolveRequest, serverName string, tr *trace
 	// that.
 	names := lookup{names: []string{serverName}, form: formClaudeCode}
 
-	m, out := resolveScopes(claudeCodeScopes(env, req.CWD, claudePath, claude, claudeRes), names, tr)
+	m, out := resolveScopes(ctx, claudeCodeScopes(loader, env, req.CWD, claudePath, claude, claudeRes), names, tr)
 	switch out {
 	case outcomeFound:
 		return resolved(env, m.key, m.entry)
@@ -82,7 +103,7 @@ func resolveClaudeCode(env Env, req ResolveRequest, serverName string, tr *trace
 // claudeCodeScopes returns the Claude Code MCP configuration scopes, highest
 // precedence first: the managed config, then the project-scoped sources, then the
 // global servers table.
-func claudeCodeScopes(env Env, cwd, claudePath string, claude claudeJSON, claudeRes loadResult) []scope {
+func claudeCodeScopes(loader *configLoader, env Env, cwd, claudePath string, claude claudeJSON, claudeRes loadResult) []scope {
 	managedPath := env.managedMCPPath()
 	// Claude Code documents the managed server set as something users cannot
 	// override, so a managed file that exists and does not list the server ends
@@ -91,12 +112,12 @@ func claudeCodeScopes(env Env, cwd, claudePath string, claude claudeJSON, claude
 		path:   managedPath,
 		key:    mcpServersKey,
 		closed: true,
-		load:   jsonServers(managedPath),
+		load:   jsonServers(loader, managedPath),
 	}}
 
 	// projectScopes hands out one consecutive rank per scope from the one it is
 	// given, so the global table sits just below the last of them.
-	project := projectScopes(env, cwd, claudePath, claude, claudeRes, 1)
+	project := projectScopes(loader, env, cwd, claudePath, claude, claudeRes, 1)
 	scopes = append(scopes, project...)
 
 	return append(scopes, scope{
@@ -119,7 +140,7 @@ const maxProjectDepth = 40
 // file outranks the projects{} entry, and a deeper directory outranks a shallower
 // one. Only the nearest .mcp.json is a scope, because only one project root is
 // ever live for a session.
-func projectScopes(env Env, cwd, claudePath string, claude claudeJSON, claudeRes loadResult, rank int) []scope {
+func projectScopes(loader *configLoader, env Env, cwd, claudePath string, claude claudeJSON, claudeRes loadResult, rank int) []scope {
 	dirs := ancestors(cwd)
 	if len(dirs) == 0 {
 		return nil
@@ -147,7 +168,7 @@ func projectScopes(env Env, cwd, claudePath string, claude claudeJSON, claudeRes
 				path: path,
 				key:  mcpServersKey,
 				rank: rank,
-				load: jsonServers(path),
+				load: jsonServers(loader, path),
 			})
 			rank++
 		}
@@ -179,10 +200,11 @@ func nearestProjectFileDir(dirs []string) string {
 	return dirs[0]
 }
 
-// ancestors returns cwd and each directory above it, nearest first.
+// ancestors returns an absolute cwd and each directory above it, nearest first.
+// A relative cwd cannot identify a stable configuration scope and is ignored.
 func ancestors(cwd string) []string {
 	cwd = strings.TrimSpace(cwd)
-	if cwd == "" {
+	if cwd == "" || !filepath.IsAbs(cwd) {
 		return nil
 	}
 	dir := filepath.Clean(cwd)

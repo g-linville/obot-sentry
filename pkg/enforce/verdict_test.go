@@ -72,47 +72,35 @@ func TestDenyGolden(t *testing.T) {
 	}
 }
 
-// A reason is a label, not a payload. An infrastructure denial's text is
-// whatever a transport, a proxy, or a non-2xx body produced — a 404 through a
-// reverse proxy is an entire HTML page — and unbounded that would bury the
-// instructions the model has to read. Bound it, and fold it onto one line so it
-// stays a single line in the block.
-func TestDenyBoundsTheReason(t *testing.T) {
-	body := "error code 404 (Not Found): <!doctype html>\n<html>\n<body>" + strings.Repeat("padding ", 200) + "</body></html>"
-	ctx := DenialContext{Tool: "echo", ServerName: "everything"}
-	denial := InfrastructureDenial(body, ctx)
-	// Bound growth, not total length: the difference from a one-rune reason is
-	// everything the body contributed, so rewording the block can't relax it.
-	baseline := InfrastructureDenial("x", ctx)
-
-	for name, msg := range map[string][2]string{
-		"agent message": {denial.AgentMessage, baseline.AgentMessage},
-		"user message":  {denial.UserMessage, baseline.UserMessage},
+func TestDenialsContainNoInvocationDetails(t *testing.T) {
+	secrets := []string{"tool-secret", "server-secret", "token-secret", "reason-secret"}
+	for name, denial := range map[string]Denial{
+		"policy":         PolicyDenial(),
+		"infrastructure": InfrastructureDenial(),
 	} {
-		if grew := len([]rune(msg[0])) - len([]rune(msg[1])); grew > maxReasonRunes {
-			t.Errorf("%s grew %d runes over a one-rune reason; an unbounded server body reached the model", name, grew)
+		for channel, message := range map[string]string{
+			"user":  denial.UserMessage,
+			"agent": denial.AgentMessage,
+		} {
+			for _, secret := range secrets {
+				if strings.Contains(message, secret) {
+					t.Errorf("%s %s denial leaked %q: %q", name, channel, secret, message)
+				}
+			}
 		}
-		if strings.Contains(msg[0], "</body></html>") {
-			t.Errorf("%s carried the response body through to its end", name)
-		}
-	}
-	if !strings.Contains(denial.AgentMessage, "error code 404 (Not Found)") {
-		t.Errorf("the reason lost the part that identifies the failure: %q", denial.AgentMessage)
-	}
-	if !strings.Contains(denial.AgentMessage, "Do not attempt the same result by any other route") {
-		t.Error("the guardrails did not survive a long reason")
-	}
-	// One line: a multi-line body must not break the block it sits in.
-	causeLine := ""
-	for line := range strings.SplitSeq(denial.AgentMessage, "\n") {
-		if strings.HasPrefix(line, "Cause:") {
-			causeLine = line
+		if !strings.Contains(denial.AgentMessage, "Do not attempt the same result by any other route") {
+			t.Errorf("%s denial lost the anti-workaround guardrails", name)
 		}
 	}
-	if causeLine == "" || strings.Contains(causeLine, "\n") {
-		t.Errorf("the reason is not a single line: %q", causeLine)
+}
+
+func TestCompactReasonBoundsInternalDiagnostic(t *testing.T) {
+	reason := "first line\n" + strings.Repeat("padding ", 200)
+	got := compactReason(reason)
+	if strings.Contains(got, "\n") {
+		t.Fatalf("compactReason retained a newline: %q", got)
 	}
-	if len([]rune(causeLine)) > maxReasonRunes+len("Cause: ")+1 {
-		t.Errorf("the cause line is %d runes, want it bounded by maxReasonRunes", len([]rune(causeLine)))
+	if len([]rune(got)) > maxReasonRunes+1 {
+		t.Fatalf("compactReason returned %d runes, want at most %d plus ellipsis", len([]rune(got)), maxReasonRunes)
 	}
 }

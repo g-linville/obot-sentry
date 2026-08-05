@@ -370,16 +370,17 @@ func claudeProjectScopes(t *testing.T, f *fixture, cwd string) []scope {
 	claudePath := f.homePath(".claude.json")
 	var claude claudeJSON
 	res := loadJSON(claudePath, &claude)
-	return projectScopes(f.Env, cwd, claudePath, claude, res, 1)
+	return projectScopes(newConfigLoader(), f.Env, cwd, claudePath, claude, res, 1)
 }
 
 func TestAncestorsNearestFirst(t *testing.T) {
-	got := ancestors(filepath.Join("/", "a", "b", "c"))
+	root := hostRoot(t)
+	got := ancestors(filepath.Join(root, "a", "b", "c"))
 	want := []string{
-		filepath.Join("/", "a", "b", "c"),
-		filepath.Join("/", "a", "b"),
-		filepath.Join("/", "a"),
-		string(filepath.Separator),
+		filepath.Join(root, "a", "b", "c"),
+		filepath.Join(root, "a", "b"),
+		filepath.Join(root, "a"),
+		root,
 	}
 	if !slices.Equal(got, want) {
 		t.Fatalf("ancestors = %v, want %v", got, want)
@@ -392,10 +393,16 @@ func TestAncestorsEmptyCWD(t *testing.T) {
 	}
 }
 
+func TestAncestorsRejectsRelativeCWD(t *testing.T) {
+	if got := ancestors(filepath.Join("project", "subdir")); got != nil {
+		t.Fatalf("ancestors = %v, want nil for a relative cwd", got)
+	}
+}
+
 // TestAncestorsIsBounded keeps a pathological path from turning into a scope per
 // level.
 func TestAncestorsIsBounded(t *testing.T) {
-	deep := string(filepath.Separator) + strings.Repeat("a"+string(filepath.Separator), maxProjectDepth*2)
+	deep := hostRoot(t) + strings.Repeat("a"+string(filepath.Separator), maxProjectDepth*2)
 	if got := ancestors(deep); len(got) != maxProjectDepth {
 		t.Fatalf("ancestors returned %d entries, want %d", len(got), maxProjectDepth)
 	}
@@ -412,10 +419,12 @@ func TestProjectScopesRanksByDepth(t *testing.T) {
 	f.write(f.homePath(".claude.json"), projectKeysJSON(project, cwd))
 
 	scopes := claudeProjectScopes(t, f, cwd)
+	// The projects{} key is quoted the way the trace renders it, which is the way
+	// the file spells it: a Windows path's backslashes come back escaped.
 	want := []string{
 		filepath.Join(cwd, ".mcp.json") + "  mcpServers",
-		f.homePath(".claude.json") + `  projects["` + cwd + `"].mcpServers`,
-		f.homePath(".claude.json") + `  projects["` + project + `"].mcpServers`,
+		f.homePath(".claude.json") + fmt.Sprintf(`  projects[%q].mcpServers`, cwd),
+		f.homePath(".claude.json") + fmt.Sprintf(`  projects[%q].mcpServers`, project),
 	}
 	if got := scopeKeys(scopes); !slices.Equal(got, want) {
 		t.Fatalf("scopes\n%v\nwant\n%v", got, want)
@@ -527,11 +536,14 @@ func TestComparableDirCaseFoldsOnWindows(t *testing.T) {
 		t.Fatalf("comparableDir = %q, want %q", got, want)
 	}
 
+	// Elsewhere the same case is a different directory. The path is written in the
+	// host's form, since comparableDir cleans with the host's separator.
 	darwin := Env{GOOS: "darwin"}
-	if got := darwin.comparableDir("/Users/Dev/Proj"); got != "/Users/Dev/Proj" {
+	mixed := filepath.Join(hostRoot(t), "Users", "Dev", "Proj")
+	if got := darwin.comparableDir(mixed); got != mixed {
 		t.Fatalf("comparableDir = %q, want the path unchanged", got)
 	}
-	if got := darwin.comparableDir("  /Users/Dev/Proj/  "); got != "/Users/Dev/Proj" {
+	if got := darwin.comparableDir("  " + mixed + string(filepath.Separator) + "  "); got != mixed {
 		t.Fatalf("comparableDir = %q, want it trimmed and cleaned", got)
 	}
 	if got := darwin.comparableDir("   "); got != "" {

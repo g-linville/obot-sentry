@@ -171,10 +171,9 @@ func DefaultExecutable() (string, error) {
 // validateExecutable rejects an executable path that must not be embedded in a
 // machine-managed hook: a missing target, a non-regular file, a non-executable
 // file, a file inside a temporary directory, or (on non-Windows platforms) a
-// file that is group- or world-writable. Deeper platform-specific ownership
-// checks (root-owned on macOS, an administrator-only ACL on Windows) are not
-// enforced here; tests inject an already-approved path rather than weakening
-// these production checks.
+// file that is group- or world-writable, or a file not owned by the platform's
+// privileged principal. os.Stat deliberately follows a final symlink; package
+// layouts may use one, but the target must satisfy every validation here.
 func validateExecutable(path string) error {
 	if path == "" {
 		return fmt.Errorf("obot-sentry executable path is empty")
@@ -204,5 +203,5 @@ func validateExecutable(path string) error {
 			return fmt.Errorf("obot-sentry executable %q is writable by non-administrators (mode %o); an MDM-managed hook must point at an admin-owned binary", path, perm)
 		}
 	}
-	return nil
+	return validateExecutableOwner(path, info)
 }

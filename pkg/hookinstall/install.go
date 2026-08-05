@@ -1,12 +1,14 @@
 package hookinstall
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"runtime"
+	"slices"
 	"text/tabwriter"
 
 	"github.com/obot-platform/obot-sentry/pkg/datadir"
@@ -204,12 +206,14 @@ func (i *Installer) Run(ctx context.Context) error {
 // plannedChange is one destination's converged bytes, decided during preflight
 // and committed afterward. write is false when the file is already current.
 type plannedChange struct {
-	dest    Destination
-	absPath string
-	data    []byte
-	status  Status
-	dupes   int
-	write   bool
+	dest     Destination
+	absPath  string
+	data     []byte
+	original []byte
+	existed  bool
+	status   Status
+	dupes    int
+	write    bool
 }
 
 // buildChanges resolves, reads, and merges every destination in memory. It
@@ -230,7 +234,7 @@ func buildChanges(ctx context.Context, plan Plan) ([]plannedChange, error) {
 		if err != nil {
 			return nil, err
 		}
-		existing, _, err := readConfigFile(d.Scope, home, abs)
+		existing, existed, err := readConfigFile(d.Scope, home, abs)
 		if err != nil {
 			return nil, fmt.Errorf("%s (%s): %w", d.Label, abs, err)
 		}
@@ -239,12 +243,14 @@ func buildChanges(ctx context.Context, plan Plan) ([]plannedChange, error) {
 			return nil, fmt.Errorf("%s (%s): %w", d.Label, abs, err)
 		}
 		changes = append(changes, plannedChange{
-			dest:    d,
-			absPath: abs,
-			data:    outcome.data,
-			status:  outcome.status,
-			dupes:   outcome.dupes,
-			write:   outcome.write,
+			dest:     d,
+			absPath:  abs,
+			data:     outcome.data,
+			original: slices.Clone(existing),
+			existed:  existed,
+			status:   outcome.status,
+			dupes:    outcome.dupes,
+			write:    outcome.write,
 		})
 	}
 	return changes, nil
@@ -274,6 +280,21 @@ func commitChanges(ctx context.Context, plan Plan, changes []plannedChange) []Re
 			continue
 		}
 		if c.write {
+			current, exists, err := readConfigFile(c.dest.Scope, homeOf(plan.User), c.absPath)
+			if err != nil {
+				r.Status = StatusFailed
+				r.Err = fmt.Errorf("re-reading before commit: %w", err)
+				r.DuplicatesRemoved = 0
+				results = append(results, r)
+				continue
+			}
+			if exists != c.existed || !bytes.Equal(current, c.original) {
+				r.Status = StatusFailed
+				r.Err = errors.New("config changed after preflight; refusing to overwrite concurrent edits")
+				r.DuplicatesRemoved = 0
+				results = append(results, r)
+				continue
+			}
 			if err := commitConfigFile(c.dest.Scope, plan.User, c.absPath, c.data); err != nil {
 				r.Status = StatusFailed
 				r.Err = err
@@ -283,6 +304,13 @@ func commitChanges(ctx context.Context, plan Plan, changes []plannedChange) []Re
 		results = append(results, r)
 	}
 	return results
+}
+
+func homeOf(u *TargetUser) string {
+	if u == nil {
+		return ""
+	}
+	return u.HomeDir
 }
 
 // writeSummary prints the run header (active user and shared identity directory)

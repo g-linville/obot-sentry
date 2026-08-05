@@ -223,7 +223,10 @@ func TestMCPSplits(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.rest, func(t *testing.T) {
-			got := mcpSplits(tc.rest)
+			got, ok := mcpSplits(tc.rest)
+			if !ok {
+				t.Fatalf("mcpSplits(%q) unexpectedly exceeded the candidate cap", tc.rest)
+			}
 			if len(got) != len(tc.want) {
 				t.Fatalf("mcpSplits(%q) = %+v, want %+v", tc.rest, got, tc.want)
 			}
@@ -231,6 +234,89 @@ func TestMCPSplits(t *testing.T) {
 				if got[i] != tc.want[i] {
 					t.Fatalf("mcpSplits(%q)[%d] = %+v, want %+v", tc.rest, i, got[i], tc.want[i])
 				}
+			}
+		})
+	}
+}
+
+func TestMCPSplitCandidateCapFailsUnresolved(t *testing.T) {
+	rest := strings.Repeat("server__", maxMCPSplitCandidates+1) + "tool"
+	class := classifyPreTool("mcp__" + rest)
+	if class.InvalidReason == "" {
+		t.Fatalf("classification generated %d candidates without enforcing the cap", len(class.Splits))
+	}
+	call := buildCall(t.Context(), Env{Home: t.TempDir(), GOOS: "darwin"}, localagent.Codex, class, ResolveRequest{
+		Agent:      localagent.Codex,
+		ServerName: class.ServerName,
+	})
+	if !call.Request.Unresolved || !strings.Contains(call.Request.UnresolvedReason, "the MCP server name could not be determined") {
+		t.Fatalf("request = %+v, want an unresolved capped split", call.Request)
+	}
+}
+
+func TestNormalizeBoundsAttackerControlledFields(t *testing.T) {
+	env := Env{Home: t.TempDir(), GOOS: "darwin"}
+	cases := []struct {
+		name    string
+		agent   localagent.Agent
+		event   Event
+		payload any
+	}{
+		{
+			name:  "tool name",
+			agent: localagent.Codex,
+			event: EventPreToolUse,
+			payload: map[string]any{
+				"tool_name": strings.Repeat("x", maxToolNameBytes+1),
+			},
+		},
+		{
+			name:  "working directory",
+			agent: localagent.Codex,
+			event: EventPreToolUse,
+			payload: map[string]any{
+				"tool_name": "Bash",
+				"cwd":       strings.Repeat("x", maxWorkingDirBytes+1),
+			},
+		},
+		{
+			name:  "server name",
+			agent: localagent.Cursor,
+			event: EventCursorBeforeMCPExecution,
+			payload: map[string]any{
+				"tool_name":       "echo",
+				"mcp_server_name": strings.Repeat("x", maxServerNameBytes+1),
+			},
+		},
+		{
+			name:  "workspace count",
+			agent: localagent.Cursor,
+			event: EventCursorBeforeMCPExecution,
+			payload: map[string]any{
+				"tool_name":       "echo",
+				"mcp_server_name": "server",
+				"workspace_roots": make([]string, maxWorkspaceRoots+1),
+			},
+		},
+		{
+			name:  "workspace length",
+			agent: localagent.Cursor,
+			event: EventCursorBeforeMCPExecution,
+			payload: map[string]any{
+				"tool_name":       "echo",
+				"mcp_server_name": "server",
+				"workspace_roots": []string{strings.Repeat("x", maxWorkspaceRootBytes+1)},
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			raw, err := json.Marshal(tc.payload)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := normalizeCall(env, tc.agent, tc.event, raw); err == nil {
+				t.Fatal("oversized field was accepted")
 			}
 		})
 	}
@@ -278,6 +364,63 @@ args = ["-y", "some-package"]
 		if !strings.Contains(call.Request.UnresolvedReason, want) {
 			t.Errorf("reason is missing %q: %s", want, call.Request.UnresolvedReason)
 		}
+	}
+}
+
+// A configured reading must remain part of the ambiguity decision even when we
+// cannot reduce its launch command to an allowlist identity. Otherwise the
+// resolved, allowlisted shorter name can shadow the actual longer server.
+func TestNormalizeMatchedButUnresolvedSplitCannotBeShadowed(t *testing.T) {
+	f := newFixture(t, "darwin")
+	f.write(f.homePath(".codex", "config.toml"), `
+[mcp_servers.allowed]
+url = "https://allowlisted.example.com/sse"
+
+[mcp_servers."allowed..shadow"]
+command = "node"
+args = ["server.js"]
+`)
+
+	call, err := normalizeCall(f.Env, localagent.Codex, EventPreToolUse,
+		[]byte(`{"tool_name":"mcp__allowed__shadow__danger","cwd":"/Users/dev/proj"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !call.Request.Unresolved {
+		t.Fatalf("resolved to server %q (%+v); the matched unresolved server was discarded",
+			call.Request.ServerName, call.Request.Server)
+	}
+	if call.Request.Server.URL != "" {
+		t.Fatalf("allowlisted shorter server answered for the ambiguous call: %+v", call.Request.Server)
+	}
+	for _, want := range []string{"more than one way", "allowed", "allowed..shadow"} {
+		if !strings.Contains(call.Request.UnresolvedReason, want) {
+			t.Errorf("reason is missing %q: %s", want, call.Request.UnresolvedReason)
+		}
+	}
+}
+
+func TestNormalizeSoleMatchedButUnresolvedSplitWinsOverMiss(t *testing.T) {
+	f := newFixture(t, "darwin")
+	f.write(f.homePath(".codex", "config.toml"), `
+[mcp_servers."allowed..shadow"]
+command = "node"
+args = ["server.js"]
+`)
+
+	call, err := normalizeCall(f.Env, localagent.Codex, EventPreToolUse,
+		[]byte(`{"tool_name":"mcp__allowed__shadow__danger","cwd":"/Users/dev/proj"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !call.Request.Unresolved {
+		t.Fatal("unsupported server identity unexpectedly resolved")
+	}
+	if call.Request.ServerName != "allowed..shadow" || call.Request.Tool != "danger" {
+		t.Fatalf("request = %+v, want the sole configured reading", call.Request)
+	}
+	if !strings.Contains(call.Request.UnresolvedReason, `stdio command "node"`) {
+		t.Fatalf("reason = %q, want the matched entry's resolution failure", call.Request.UnresolvedReason)
 	}
 }
 

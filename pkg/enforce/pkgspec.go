@@ -2,10 +2,149 @@ package enforce
 
 import (
 	"fmt"
+	"maps"
+	"slices"
 	"strings"
 
 	"github.com/obot-platform/obot/apiclient/types"
 )
+
+// Package-runner identity is derived from a configuration entry, but both npx
+// and uvx also accept environment variables that can redirect package resolution
+// or inject code before the named package starts. These checks deliberately do
+// not inspect executable ownership: user-local and Homebrew installations are
+// valid. They constrain only configured and inherited process environment.
+
+var commonConfiguredPackageEnv = map[string]struct{}{
+	"PATH":                  {}, // selects a different npx/uvx executable
+	"PATHEXT":               {}, // changes Windows executable selection
+	"COMSPEC":               {}, // changes the command processor for .cmd shims
+	"LD_PRELOAD":            {}, // injects a library before the runner starts
+	"LD_LIBRARY_PATH":       {}, // redirects native library loading
+	"DYLD_INSERT_LIBRARIES": {},
+	"DYLD_LIBRARY_PATH":     {},
+	"DYLD_FRAMEWORK_PATH":   {},
+	"HOME":                  {}, // redirects per-user package-manager config
+	"USERPROFILE":           {},
+	"APPDATA":               {},
+	"LOCALAPPDATA":          {},
+	"XDG_CONFIG_HOME":       {},
+}
+
+var commonInheritedPackageEnv = map[string]struct{}{
+	"LD_PRELOAD":            {},
+	"LD_LIBRARY_PATH":       {},
+	"DYLD_INSERT_LIBRARIES": {},
+	"DYLD_LIBRARY_PATH":     {},
+	"DYLD_FRAMEWORK_PATH":   {},
+}
+
+var npxExactPackageEnv = map[string]struct{}{
+	"NODE_OPTIONS":                 {},
+	"NODE_PATH":                    {},
+	"NODE_TLS_REJECT_UNAUTHORIZED": {},
+}
+
+var uvxExactPackageEnv = map[string]struct{}{
+	"PYTHONHOME": {},
+	"PYTHONPATH": {},
+}
+
+// Inherited package-manager configuration is intentionally narrower than the
+// configured-entry check. Developer shells commonly carry identity-neutral
+// settings such as NPM_CONFIG_PREFIX or UV_NO_CACHE; rejecting every prefix
+// member would break those installations. These are the inherited values that
+// directly redirect a source or inject execution behavior.
+var npxInheritedConfigEnv = map[string]struct{}{
+	"NPM_CONFIG_REGISTRY":     {},
+	"NPM_CONFIG_USERCONFIG":   {},
+	"NPM_CONFIG_GLOBALCONFIG": {},
+	"NPM_CONFIG_NODE_OPTIONS": {},
+	"NPM_CONFIG_SCRIPT_SHELL": {},
+	"NPM_CONFIG_SHELL":        {},
+	"COREPACK_NPM_REGISTRY":   {},
+}
+
+var uvxInheritedConfigEnv = map[string]struct{}{
+	"UV_INDEX":              {},
+	"UV_INDEX_URL":          {},
+	"UV_DEFAULT_INDEX":      {},
+	"UV_EXTRA_INDEX_URL":    {},
+	"UV_FIND_LINKS":         {},
+	"UV_KEYRING_PROVIDER":   {},
+	"UV_CONSTRAINT":         {},
+	"UV_OVERRIDE":           {},
+	"UV_PROJECT":            {},
+	"UV_DIRECTORY":          {},
+	"UV_PYTHON":             {},
+	"UV_TOOL_DIR":           {},
+	"UV_PYTHON_INSTALL_DIR": {},
+}
+
+func unsafeConfiguredPackageEnv(run runner, env map[string]string) (string, bool) {
+	names := slices.Sorted(maps.Keys(env))
+	for _, name := range names {
+		if packageEnvAffectsIdentity(run, name, true) {
+			return name, true
+		}
+	}
+	return "", false
+}
+
+func unsafeInheritedPackageEnv(run runner, environ []string) (string, bool) {
+	names := make([]string, 0, len(environ))
+	for _, assignment := range environ {
+		name, value, ok := strings.Cut(assignment, "=")
+		if !ok || strings.TrimSpace(value) == "" {
+			continue
+		}
+		if packageEnvAffectsIdentity(run, name, false) {
+			names = append(names, name)
+		}
+	}
+	if len(names) == 0 {
+		return "", false
+	}
+	slices.Sort(names)
+	return names[0], true
+}
+
+func packageEnvAffectsIdentity(run runner, name string, configured bool) bool {
+	name = strings.ToUpper(strings.TrimSpace(name))
+	if name == "" {
+		return false
+	}
+	if configured {
+		if _, ok := commonConfiguredPackageEnv[name]; ok {
+			return true
+		}
+	} else if _, ok := commonInheritedPackageEnv[name]; ok {
+		return true
+	}
+
+	switch run {
+	case runnerNPX:
+		if _, ok := npxExactPackageEnv[name]; ok {
+			return true
+		}
+		if configured {
+			return strings.HasPrefix(name, "NPM_CONFIG_") || strings.HasPrefix(name, "COREPACK_")
+		}
+		_, ok := npxInheritedConfigEnv[name]
+		return ok
+	case runnerUVX:
+		if _, ok := uvxExactPackageEnv[name]; ok {
+			return true
+		}
+		if configured {
+			return strings.HasPrefix(name, "UV_")
+		}
+		_, ok := uvxInheritedConfigEnv[name]
+		return ok
+	default:
+		return false
+	}
+}
 
 type runner int
 

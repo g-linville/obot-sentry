@@ -47,12 +47,13 @@ func TestDestinationsModel(t *testing.T) {
 	})
 	t.Run("windows", func(t *testing.T) {
 		t.Setenv("ProgramData", `C:\ProgramData`)
+		programData := windowsProgramData()
 		dests := Destinations("windows")
 		want := []Destination{
 			{Agent: localagent.ClaudeCode, Label: "Claude Code", Scope: ScopeUser, Format: FormatJSON, Rel: ".claude/settings.json"},
-			{Agent: localagent.Codex, Label: "Codex", Scope: ScopeMachine, Format: FormatTOML, Abs: `C:\ProgramData\OpenAI\Codex\requirements.toml`},
+			{Agent: localagent.Codex, Label: "Codex", Scope: ScopeMachine, Format: FormatTOML, Abs: winJoin(programData, "OpenAI", "Codex", "requirements.toml")},
 			{Agent: localagent.VSCode, Label: "Visual Studio Code", Scope: ScopeUser, Format: FormatJSON, Rel: ".copilot/hooks/obot-sentry.json"},
-			{Agent: localagent.Cursor, Label: "Cursor", Scope: ScopeMachine, Format: FormatJSON, Abs: `C:\ProgramData\Cursor\hooks.json`},
+			{Agent: localagent.Cursor, Label: "Cursor", Scope: ScopeMachine, Format: FormatJSON, Abs: winJoin(programData, "Cursor", "hooks.json")},
 			{Agent: localagent.VSCode, Label: "VS Code settings", Scope: ScopeUser, Format: FormatJSONC, Rel: "AppData/Roaming/Code/User/settings.json"},
 		}
 		assertDestinations(t, dests, want)

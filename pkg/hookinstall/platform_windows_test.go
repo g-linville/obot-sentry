@@ -170,3 +170,24 @@ func TestFindWindowsConsoleUserPreservesEnumerationError(t *testing.T) {
 		}
 	}
 }
+
+func TestTrustedExecutableOwner(t *testing.T) {
+	system, err := windows.CreateWellKnownSid(windows.WinLocalSystemSid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	admins, err := windows.CreateWellKnownSid(windows.WinBuiltinAdministratorsSid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	users, err := windows.CreateWellKnownSid(windows.WinBuiltinUsersSid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !trustedExecutableOwner(system) || !trustedExecutableOwner(admins) {
+		t.Fatal("SYSTEM or Administrators ownership was rejected")
+	}
+	if trustedExecutableOwner(users) || trustedExecutableOwner(nil) {
+		t.Fatal("an untrusted executable owner was accepted")
+	}
+}

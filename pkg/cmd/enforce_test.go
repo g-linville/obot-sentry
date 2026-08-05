@@ -43,6 +43,22 @@ func runCommand(t *testing.T, root *cobra.Command, args ...string) (string, stri
 	return stdout.String(), stderr.String(), err
 }
 
+type errorWriter struct{ err error }
+
+func (w errorWriter) Write([]byte) (int, error) { return 0, w.err }
+
+// hookPayload renders a pre-tool hook payload naming tool and cwd. The cwd is
+// encoded rather than interpolated into the JSON: a Windows path is full of
+// backslashes, and a backslash opens an escape inside a JSON string.
+func hookPayload(t *testing.T, tool, cwd string) string {
+	t.Helper()
+	data, err := json.Marshal(map[string]string{"tool_name": tool, "cwd": cwd})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(data)
+}
+
 func writeTempFile(t *testing.T, content string) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "payload.json")
@@ -77,7 +93,7 @@ func TestEnforcePrintNormalizedDryRun(t *testing.T) {
 	writeFixtureFile(t, filepath.Join(home, ".claude.json"), `{"mcpServers":{
 		"linear": {"command": "npx", "args": ["-y", "linear-mcp@1.2.3"]}
 	}}`)
-	input := writeTempFile(t, `{"tool_name":"mcp__linear__search_issues","cwd":"`+home+`"}`)
+	input := writeTempFile(t, hookPayload(t, "mcp__linear__search_issues", home))
 
 	stdout, stderr, err := runCommand(t, enforceRoot(t, mdmconfig.Config{}),
 		"enforce", "--agent", "claude-code", "--event", "PreToolUse",
@@ -106,7 +122,7 @@ func TestEnforcePrintNormalizedDryRun(t *testing.T) {
 
 func TestEnforceDeniesWithNoServerConfigured(t *testing.T) {
 	home := homeFixture(t)
-	input := writeTempFile(t, `{"tool_name":"Bash","cwd":"`+home+`"}`)
+	input := writeTempFile(t, hookPayload(t, "Bash", home))
 
 	stdout, stderr, err := runCommand(t, enforceRoot(t, mdmconfig.Config{}),
 		"enforce", "--agent", "claude-code", "--event", "PreToolUse", "--input", input)
@@ -126,11 +142,11 @@ func TestEnforceDeniesWithNoServerConfigured(t *testing.T) {
 	if out.HookSpecificOutput.PermissionDecision != "deny" {
 		t.Errorf("permissionDecision = %q, want deny", out.HookSpecificOutput.PermissionDecision)
 	}
-	if !strings.Contains(out.HookSpecificOutput.PermissionDecisionReason, "no Obot server URL is configured") {
-		t.Errorf("deny reason = %q, want it to name the missing configuration", out.HookSpecificOutput.PermissionDecisionReason)
+	if strings.Contains(out.HookSpecificOutput.PermissionDecisionReason, "no Obot server URL is configured") {
+		t.Errorf("deny response exposed infrastructure detail: %q", out.HookSpecificOutput.PermissionDecisionReason)
 	}
-	if !strings.Contains(stderr, "no Obot server URL is configured") {
-		t.Errorf("stderr = %q, want the blocking reason", stderr)
+	if stderr != "obot-sentry enforce: blocked\n" {
+		t.Errorf("stderr = %q, want only the static block notice", stderr)
 	}
 }
 
@@ -151,8 +167,8 @@ func TestEnforceUnsupportedAgentExitsNonZero(t *testing.T) {
 	if stdout != "" {
 		t.Errorf("stdout = %q, want nothing on the protocol channel", stdout)
 	}
-	if !strings.Contains(stderr, `unsupported enforcement agent "vscode"`) {
-		t.Errorf("stderr = %q, want the reason", stderr)
+	if stderr != "obot-sentry enforce: blocked\n" {
+		t.Errorf("stderr = %q, want only the static block notice", stderr)
 	}
 }
 
@@ -196,7 +212,7 @@ func TestEnforceUnparseableInvocationExitsBlocking(t *testing.T) {
 
 func TestEnforceManagedByMarker(t *testing.T) {
 	home := homeFixture(t)
-	input := writeTempFile(t, `{"tool_name":"Bash","cwd":"`+home+`"}`)
+	input := writeTempFile(t, hookPayload(t, "Bash", home))
 
 	if _, _, err := runCommand(t, enforceRoot(t, mdmconfig.Config{}),
 		"enforce", "--agent", "claude-code", "--event", "PreToolUse",
@@ -208,6 +224,177 @@ func TestEnforceManagedByMarker(t *testing.T) {
 		"enforce", "--agent", "claude-code", "--event", "PreToolUse",
 		"--input", input, "--managed-by", "someone-else", "--dry-run"); err == nil {
 		t.Fatal("a foreign --managed-by value was accepted")
+	}
+}
+
+func TestEnforceServerURLIgnoresEnvironment(t *testing.T) {
+	home := homeFixture(t)
+	input := writeTempFile(t, hookPayload(t, "Bash", home))
+	t.Setenv("OBOT_SENTRY_SERVER_URL", "https://attacker.invalid")
+	t.Setenv("ENFORCE_SERVER_URL", "https://also-attacker.invalid")
+
+	cmd, hook := newEnforceCommand()
+	cmd.SetArgs([]string{"--agent", "claude-code", "--event", "PreToolUse", "--input", input, "--dry-run"})
+	cmd.SetOut(&bytes.Buffer{})
+	cmd.SetErr(&bytes.Buffer{})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("enforce --dry-run: %v", err)
+	}
+	if hook.serverURL != "" {
+		t.Fatalf("server URL was populated from the environment: %q", hook.serverURL)
+	}
+
+	hook.loadMDMConfig = func() (mdmconfig.Config, error) {
+		return mdmconfig.Config{ServerURL: "https://mdm.example.com"}, nil
+	}
+	cfg, err := hook.resolveConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.ServerURL != "https://mdm.example.com" {
+		t.Fatalf("resolved server URL = %q, want the protected MDM value", cfg.ServerURL)
+	}
+}
+
+func TestEnforceProtocolFlagsIgnoreEnvironment(t *testing.T) {
+	home := homeFixture(t)
+	input := writeTempFile(t, `{"tool_name":"Bash","cwd":"`+home+`"}`)
+	root := enforceRoot(t, mdmconfig.Config{})
+
+	// These names used to be implicit bindings created by the command builder.
+	// A hook inherits the invoking agent's environment, so either debug flag
+	// could turn a real decision into a successful, response-free dry run or
+	// corrupt stdout with diagnostic JSON.
+	t.Setenv("ENFORCE_DRY_RUN", "true")
+	t.Setenv("ENFORCE_PRINT_NORMALIZED", "true")
+
+	stdout, stderr, err := runCommand(t, root,
+		"enforce", "--agent", "claude-code", "--event", "PreToolUse", "--input", input)
+	if err != nil {
+		t.Fatalf("the hook exited non-zero: %v", err)
+	}
+	var out struct {
+		HookSpecificOutput struct {
+			PermissionDecision string `json:"permissionDecision"`
+		} `json:"hookSpecificOutput"`
+	}
+	if err := json.Unmarshal([]byte(stdout), &out); err != nil {
+		t.Fatalf("stdout is not one protocol response: %v (%q)", err, stdout)
+	}
+	if out.HookSpecificOutput.PermissionDecision != "deny" {
+		t.Fatalf("permissionDecision = %q, want deny", out.HookSpecificOutput.PermissionDecision)
+	}
+	if stderr != "obot-sentry enforce: blocked\n" {
+		t.Fatalf("stderr = %q, want a real blocking decision", stderr)
+	}
+}
+
+func TestEnforceInputIgnoresEnvironment(t *testing.T) {
+	home := homeFixture(t)
+	root := enforceRoot(t, mdmconfig.Config{})
+	fake := writeTempFile(t, `{"tool_name":"Read","cwd":"`+home+`"}`)
+	t.Setenv("ENFORCE_INPUT", fake)
+
+	stdinPath := writeTempFile(t, `{"tool_name":"Bash","cwd":"`+home+`"}`)
+	stdin, err := os.Open(stdinPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	originalStdin := os.Stdin
+	os.Stdin = stdin
+	t.Cleanup(func() {
+		os.Stdin = originalStdin
+		_ = stdin.Close()
+	})
+
+	stdout, _, err := runCommand(t, root,
+		"enforce", "--agent", "codex", "--event", "PreToolUse", "--dry-run", "--print-normalized")
+	if err != nil {
+		t.Fatalf("enforce --dry-run: %v", err)
+	}
+	var req types.EnforcementDecisionRequest
+	if err := json.Unmarshal([]byte(stdout), &req); err != nil {
+		t.Fatalf("stdout is not the normalized request: %v (%q)", err, stdout)
+	}
+	if req.Tool != "Bash" || req.Kind != "shell" {
+		t.Fatalf("request = %+v, want the real stdin payload rather than ENFORCE_INPUT", req)
+	}
+}
+
+func TestEnforceAgentAndEventIgnoreEnvironment(t *testing.T) {
+	home := homeFixture(t)
+	input := writeTempFile(t, `{"tool_name":"Bash","cwd":"`+home+`"}`)
+	root := enforceRoot(t, mdmconfig.Config{})
+	t.Setenv("ENFORCE_AGENT", "claude-code")
+	t.Setenv("ENFORCE_EVENT", "PreToolUse")
+
+	stdout, _, err := runCommand(t, root, "enforce", "--input", input)
+	var exitErr *ExitCodeError
+	if !errors.As(err, &exitErr) || exitErr.Code != 2 {
+		t.Fatalf("err = %v, want blocking exit code 2 with no explicit agent or event", err)
+	}
+	if stdout != "" {
+		t.Fatalf("stdout = %q, want no protocol response for an unusable invocation", stdout)
+	}
+}
+
+func TestEnforceManagedByIgnoresEnvironment(t *testing.T) {
+	home := homeFixture(t)
+	input := writeTempFile(t, `{"tool_name":"Bash","cwd":"`+home+`"}`)
+	root := enforceRoot(t, mdmconfig.Config{})
+	t.Setenv("ENFORCE_MANAGED_BY", "someone-else")
+
+	stdout, _, err := runCommand(t, root,
+		"enforce", "--agent", "claude-code", "--event", "PreToolUse", "--input", input)
+	if err != nil {
+		t.Fatalf("environment supplied --managed-by affected the invocation: %v", err)
+	}
+	var out struct {
+		HookSpecificOutput struct {
+			PermissionDecision string `json:"permissionDecision"`
+		} `json:"hookSpecificOutput"`
+	}
+	if err := json.Unmarshal([]byte(stdout), &out); err != nil {
+		t.Fatalf("stdout is not a hook response: %v (%q)", err, stdout)
+	}
+	if out.HookSpecificOutput.PermissionDecision != "deny" {
+		t.Fatalf("permissionDecision = %q, want deny", out.HookSpecificOutput.PermissionDecision)
+	}
+}
+
+func TestEnforceExplicitServerURLOverridesMDM(t *testing.T) {
+	cmd, hook := newEnforceCommand()
+	if err := cmd.Flags().Parse([]string{"--server-url", "https://explicit.example.com"}); err != nil {
+		t.Fatal(err)
+	}
+	hook.loadMDMConfig = func() (mdmconfig.Config, error) {
+		return mdmconfig.Config{ServerURL: "https://mdm.example.com"}, nil
+	}
+	cfg, err := hook.resolveConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.ServerURL != "https://explicit.example.com" {
+		t.Fatalf("resolved server URL = %q, want explicit override", cfg.ServerURL)
+	}
+}
+
+func TestEnforceResponseWriteFailureExitsBlocking(t *testing.T) {
+	home := homeFixture(t)
+	input := writeTempFile(t, hookPayload(t, "Bash", home))
+	wantErr := errors.New("hook stdout is closed")
+	root := enforceRoot(t, mdmconfig.Config{})
+	root.SetOut(errorWriter{err: wantErr})
+	root.SetErr(&bytes.Buffer{})
+	root.SetArgs([]string{"enforce", "--agent", "claude-code", "--event", "PreToolUse", "--input", input})
+	err := root.Execute()
+
+	var exitErr *ExitCodeError
+	if !errors.As(err, &exitErr) || exitErr.Code != 2 {
+		t.Fatalf("err = %v, want blocking exit code 2", err)
+	}
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("err = %v, want it to wrap the output failure", err)
 	}
 }
 

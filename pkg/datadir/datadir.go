@@ -7,7 +7,6 @@ package datadir
 import (
 	"os"
 	"path/filepath"
-	"runtime"
 
 	"github.com/adrg/xdg"
 	"github.com/obot-platform/obot-sentry/pkg/fileutil"
@@ -50,17 +49,9 @@ func Dir() (string, error) {
 // the per-user Dir (see identity.Load); on Windows, ProgramData is
 // user-creatable by default and the MSI can pre-create the directory.
 func MachineDir() (string, error) {
-	var base string
-	switch runtime.GOOS {
-	case "windows":
-		base = os.Getenv("ProgramData")
-	case "darwin":
-		base = "/Library/Application Support"
-	default:
-		base = "/var/lib"
-	}
-	if base == "" {
-		return "", os.ErrNotExist
+	base, err := machineBaseDir()
+	if err != nil {
+		return "", err
 	}
 	dir := filepath.Join(base, "obot", "obot-sentry")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
