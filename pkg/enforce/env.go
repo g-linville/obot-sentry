@@ -132,6 +132,14 @@ type configLoader struct {
 	jsonServerSets  map[string]cachedServerSet
 	codexServerSets map[string]cachedServerSet
 	claudeDocs      map[string]cachedClaudeJSON
+	// pluginInstalls is keyed by the working directory the installations were
+	// discovered for, since a project-scoped installation depends on it.
+	pluginInstalls map[string]cachedPluginInstalls
+}
+
+type cachedPluginInstalls struct {
+	installs []pluginInstall
+	gap      *pluginGap
 }
 
 func newConfigLoader() *configLoader {
@@ -140,6 +148,7 @@ func newConfigLoader() *configLoader {
 		jsonServerSets:  map[string]cachedServerSet{},
 		codexServerSets: map[string]cachedServerSet{},
 		claudeDocs:      map[string]cachedClaudeJSON{},
+		pluginInstalls:  map[string]cachedPluginInstalls{},
 	}
 }
 

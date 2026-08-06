@@ -53,6 +53,12 @@ type Resolution struct {
 	Reason string
 	// Trace lists every source consulted, in order.
 	Trace []TraceStep
+
+	// unenumerated marks a denial caused by a source we could not enumerate rather
+	// than by the name itself — see pluginGap. It is what stops such a reading of an
+	// ambiguous tool name from being discarded in favor of one that did resolve,
+	// which would put the gap back where it started.
+	unenumerated bool
 }
 
 // String renders the human-readable summary of a resolved identity, for the
@@ -312,6 +318,18 @@ func (t *tracer) miss(path, key string, res loadResult) {
 		Path:   path,
 		Key:    key,
 		Exists: res != loadAbsent,
+		Note:   note,
+	})
+}
+
+// gap records a source that exists and could not be enumerated. Unlike miss it
+// carries its own note: "unreadable or malformed" is not why a bounded walk stopped
+// or why a directory would not list.
+func (t *tracer) gap(path, key, note string) {
+	t.steps = append(t.steps, TraceStep{
+		Path:   path,
+		Key:    key,
+		Exists: true,
 		Note:   note,
 	})
 }

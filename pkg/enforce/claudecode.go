@@ -76,15 +76,28 @@ func resolveClaudeCode(ctx context.Context, loader *configLoader, env Env, req R
 	// that.
 	names := lookup{names: []string{serverName}, form: formClaudeCode}
 
-	m, out := resolveScopes(ctx, claudeCodeScopes(loader, env, req.CWD, claudePath, claude, claudeRes), names, tr)
+	scopes, gap := claudeCodeScopes(ctx, loader, env, req.CWD, serverName, claudePath, claude, claudeRes)
+	m, out := resolveScopes(ctx, scopes, names, tr)
 	switch out {
-	case outcomeFound:
-		return resolved(env, m.key, m.entry)
 	case outcomeAmbiguous:
 		return ambiguous(req.Agent, serverName)
 	case outcomeClosed:
+		// The managed lockdown stops plugin servers from running at all, so an
+		// incompletely enumerated plugin tree cannot change this answer and is not
+		// worth reporting over it.
 		return notFound(req.Agent, serverName, fmt.Sprintf(
 			"MCP server %q is not in Claude Code's managed MCP configuration, which cannot be overridden", serverName))
+	}
+
+	// A plugin source we could not enumerate denies whatever the ladder concluded,
+	// including a match: with the plugin set unknown, we cannot say the entry we found
+	// is the only one folding to this namespace. See pluginGap.
+	if gap != nil {
+		return unresolvedPluginGap(serverName, gap, tr)
+	}
+
+	if out == outcomeFound {
+		return resolved(env, m.key, m.entry)
 	}
 
 	if connector, ok := resolveClaudeAIConnector(claude, claudeRes, claudePath, serverName, tr); ok {
@@ -102,12 +115,19 @@ func resolveClaudeCode(ctx context.Context, loader *configLoader, env Env, req R
 
 // claudeCodeScopes returns the Claude Code MCP configuration scopes, highest
 // precedence first: the managed config, then the project-scoped sources, then the
-// global servers table.
-func claudeCodeScopes(loader *configLoader, env Env, cwd, claudePath string, claude claudeJSON, claudeRes loadResult) []scope {
+// global servers table, then the installed plugins.
+// It also reports a plugin source that exists and could not be enumerated, which
+// denies rather than falling through — see pluginGap.
+func claudeCodeScopes(ctx context.Context, loader *configLoader, env Env, cwd, serverName, claudePath string, claude claudeJSON, claudeRes loadResult) ([]scope, *pluginGap) {
 	managedPath := env.managedMCPPath()
 	// Claude Code documents the managed server set as something users cannot
 	// override, so a managed file that exists and does not list the server ends
 	// resolution rather than falling through to user configuration.
+	//
+	// That exclusivity reaches plugin servers too, and not by inference: the agent
+	// returns the managed set before plugin discovery runs at all, and the one
+	// documented escape from the lockdown covers claude.ai connectors only. A
+	// managed file therefore ends a plugin call here as well, with the same reason.
 	scopes := []scope{{
 		path:   managedPath,
 		key:    mcpServersKey,
@@ -120,12 +140,20 @@ func claudeCodeScopes(loader *configLoader, env Env, cwd, claudePath string, cla
 	project := projectScopes(loader, env, cwd, claudePath, claude, claudeRes, 1)
 	scopes = append(scopes, project...)
 
-	return append(scopes, scope{
+	globalRank := 1 + len(project)
+	scopes = append(scopes, scope{
 		path: claudePath,
 		key:  mcpServersKey,
-		rank: 1 + len(project),
+		rank: globalRank,
 		load: fixedServers(decodeServers(claude.MCPServers), claudeRes),
 	})
+
+	// Plugins rank last. The agent merges their servers first and lets user, project,
+	// and local configuration overwrite them by key, and nothing reserves the plugin
+	// namespace against a user writing one of its names by hand — so a name declared
+	// in both places is the user's, not the plugin's.
+	plugin, gap := claudePluginScopes(ctx, loader, env, cwd, serverName, globalRank+1)
+	return append(scopes, plugin...), gap
 }
 
 // maxProjectDepth bounds the ancestor walk.

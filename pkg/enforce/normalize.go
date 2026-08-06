@@ -425,6 +425,13 @@ func splitCandidateMatched(res Resolution) bool {
 	if !res.Unresolved {
 		return true
 	}
+	// A reading whose sources could not be enumerated is viable too, and for the same
+	// reason the other unresolved-but-matched cases are: we cannot say it named
+	// nothing, so letting a fully resolved sibling reading answer for it would report
+	// a permitted server for a call that may have gone somewhere we never looked.
+	if res.unenumerated {
+		return true
+	}
 	for _, step := range res.Trace {
 		if step.Matched {
 			return true
