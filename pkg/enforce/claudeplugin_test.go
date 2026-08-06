@@ -18,10 +18,22 @@ func (f *fixture) installPlugin(key string) string {
 	name, _, _ := strings.Cut(key, "@")
 	root := f.homePath(".claude", "plugins", "cache", "market", name, "1.0.0")
 	f.mkdir(root)
-	f.write(f.homePath(".claude", "plugins", "installed_plugins.json"), fmt.Sprintf(
+	f.write(f.homePath(".claude", "plugins", claudeInstalledPluginsFile), fmt.Sprintf(
 		`{"version":2,"plugins":{%s:[{"scope":"user","installPath":%s,"version":"1.0.0"}]}}`,
 		quote(key), quote(root)))
 	return root
+}
+
+// installSkillPlugin writes a skill directory that also declares a plugin: the
+// document whose frontmatter carries a manifest key, which is what makes it one, and
+// the server file that is then read from it.
+func (f *fixture) installSkillPlugin(dir, servers string) string {
+	f.t.Helper()
+	f.mkdir(dir)
+	f.write(filepath.Join(dir, claudeSkillDoc),
+		"---\nname: "+filepath.Base(dir)+"\nmcpServers: {}\n---\n\nbody\n")
+	f.write(filepath.Join(dir, claudePluginMCPFile), servers)
+	return dir
 }
 
 // TestClaudeCodePluginResolvesFromMCPJSON is the shape every plugin on a real
@@ -259,25 +271,76 @@ func TestClaudeCodePluginSkillsDir(t *testing.T) {
 	f := newFixture(t, "darwin")
 	project := f.path("proj")
 
-	global := f.mkdir(f.homePath(".claude", "skills", "notes"))
-	f.write(filepath.Join(global, ".mcp.json"), `{"notes":{"url":"https://global-skill.example.com/mcp"}}`)
-	local := f.mkdir(filepath.Join(project, ".claude", "skills", "deploy"))
-	f.write(filepath.Join(local, ".mcp.json"), `{"deploy":{"url":"https://project-skill.example.com/mcp"}}`)
+	f.installSkillPlugin(f.homePath(".claude", "skills", "notes"),
+		`{"notes":{"url":"https://global-skill.example.com/mcp"}}`)
+	local := f.installSkillPlugin(filepath.Join(project, ".claude", "skills", "deploy"),
+		`{"deploy":{"url":"https://project-skill.example.com/mcp"}}`)
 
 	assertURL(t, Resolve(f.Env, claudeCodeReq("plugin_notes_notes", project)), "https://global-skill.example.com/mcp")
 	assertURL(t, Resolve(f.Env, claudeCodeReq("plugin_deploy_deploy", project)), "https://project-skill.example.com/mcp")
-
-	// The project skills root is found from a subdirectory too, the way the agent
-	// finds the project it was launched in.
-	// TODO(g-linville): verify that this is how Claude Code actually works.
-	deep := f.mkdir(filepath.Join(project, "src", "pkg"))
-	assertURL(t, Resolve(f.Env, claudeCodeReq("plugin_deploy_deploy", deep)), "https://project-skill.example.com/mcp")
 
 	// A skills plugin carries no manifest, so only its own file is consulted.
 	res := Resolve(f.Env, claudeCodeReq("plugin_deploy_deploy", project))
 	if last := res.Trace[len(res.Trace)-1]; last.Path != filepath.Join(local, ".mcp.json") {
 		t.Fatalf("expected the match on the skill's own file:\n%s", resolveTrace(res))
 	}
+}
+
+// TestClaudeCodePluginSkillsDirIsNotWalkedUpwards covers the project skills root.
+// The agent looks in the directory it was launched in and nowhere above it, so a
+// call made from a subdirectory does not reach the project's skills tree.
+func TestClaudeCodePluginSkillsDirIsNotWalkedUpwards(t *testing.T) {
+	f := newFixture(t, "darwin")
+	project := f.path("proj")
+	f.installSkillPlugin(filepath.Join(project, ".claude", "skills", "deploy"),
+		`{"deploy":{"url":"https://project-skill.example.com/mcp"}}`)
+
+	assertURL(t, Resolve(f.Env, claudeCodeReq("plugin_deploy_deploy", project)),
+		"https://project-skill.example.com/mcp")
+
+	deep := f.mkdir(filepath.Join(project, "src", "pkg"))
+	assertUnresolved(t, Resolve(f.Env, claudeCodeReq("plugin_deploy_deploy", deep)), "was not found")
+}
+
+// TestClaudeCodePluginSkillsDirNeedsAManifestKey covers the gate on a skill
+// directory. A skill that is only a skill never becomes a plugin, however it is
+// furnished, so its server file is never read — treating one as a plugin would let a
+// file that never loads answer for a call.
+func TestClaudeCodePluginSkillsDirNeedsAManifestKey(t *testing.T) {
+	const servers = `{"notes":{"url":"https://skill.example.com/mcp"}}`
+
+	// skillDir builds a skill directory carrying a server file and the given document.
+	skillDir := func(t *testing.T, doc string) *fixture {
+		t.Helper()
+		f := newFixture(t, "darwin")
+		dir := f.mkdir(f.homePath(".claude", "skills", "notes"))
+		f.write(filepath.Join(dir, claudePluginMCPFile), servers)
+		if doc != "" {
+			f.write(filepath.Join(dir, claudeSkillDoc), doc)
+		}
+		return f
+	}
+
+	for name, doc := range map[string]string{
+		"no skill document":     "",
+		"no frontmatter":        "just a body\n",
+		"unterminated block":    "---\nname: notes\nmcpServers: {}\n",
+		"no manifest key":       "---\nname: notes\ndescription: just a skill\n---\n\nbody\n",
+		"key present but empty": "---\nname: notes\nmcpServers:\n---\n\nbody\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := skillDir(t, doc)
+			assertUnresolved(t, Resolve(f.Env, claudeCodeReq("plugin_notes_notes", f.path("proj"))),
+				"was not found")
+		})
+	}
+
+	// Any one of the manifest keys is enough; it does not have to be the server one.
+	t.Run("another manifest key entirely", func(t *testing.T) {
+		f := skillDir(t, "---\nname: notes\nagents: [reviewer]\n---\n\nbody\n")
+		assertURL(t, Resolve(f.Env, claudeCodeReq("plugin_notes_notes", f.path("proj"))),
+			"https://skill.example.com/mcp")
+	})
 }
 
 // TestClaudeCodePluginProjectScopeInstallIgnoredElsewhere covers an installation
@@ -305,22 +368,35 @@ func TestClaudeCodePluginProjectScopeInstallIgnoredElsewhere(t *testing.T) {
 	assertURL(t, Resolve(f.Env, claudeCodeReq("plugin_acme_tools", theirs)), "https://theirs.example.com/mcp")
 }
 
-// TestClaudeCodePluginRegistryV2Supersedes covers the newer registry filename taking
-// precedence over the original.
-func TestClaudeCodePluginRegistryV2Supersedes(t *testing.T) {
+// TestClaudeCodePluginRegistryOlderShape covers the older registry layout, which
+// records one installation as a bare object and does not say where it was installed
+// to. That location is implied by the plugin's identity and version instead, and a
+// registry we could not decode would be a gap that denies every plugin call.
+func TestClaudeCodePluginRegistryOlderShape(t *testing.T) {
 	f := newFixture(t, "darwin")
-	old := f.mkdir(f.homePath("old"))
-	current := f.mkdir(f.homePath("current"))
-	f.write(filepath.Join(old, ".mcp.json"), `{"tools":{"url":"https://old.example.com/mcp"}}`)
-	f.write(filepath.Join(current, ".mcp.json"), `{"tools":{"url":"https://current.example.com/mcp"}}`)
-	// TODO(g-linville): make sure this is how Claude Code actually works.
-	f.write(f.homePath(".claude", "plugins", "installed_plugins.json"), fmt.Sprintf(
-		`{"plugins":{"acme@market":[{"scope":"user","installPath":%s}]}}`, quote(old)))
-	f.write(f.homePath(".claude", "plugins", "installed_plugins_v2.json"), fmt.Sprintf(
-		`{"plugins":{"acme@market":[{"scope":"user","installPath":%s}]}}`, quote(current)))
+	root := f.mkdir(f.homePath(".claude", "plugins", "cache", "market", "acme", "1.0.0"))
+	f.write(filepath.Join(root, ".mcp.json"), `{"tools":{"url":"https://older.example.com/mcp"}}`)
+	f.write(f.homePath(".claude", "plugins", claudeInstalledPluginsFile),
+		`{"plugins":{"acme@market":{"version":"1.0.0","installedAt":"2026-01-01T00:00:00.000Z"}}}`)
 
 	assertURL(t, Resolve(f.Env, claudeCodeReq("plugin_acme_tools", f.path("proj"))),
-		"https://current.example.com/mcp")
+		"https://older.example.com/mcp")
+}
+
+// TestClaudeCodePluginCacheDirOverride covers the environment override for the
+// plugin tree, which relocates the registry and everything it indexes.
+func TestClaudeCodePluginCacheDirOverride(t *testing.T) {
+	f := newFixture(t, "darwin")
+	plugins := f.mkdir(f.path("plugin-tree"))
+	f.setenv(claudePluginCacheDirEnv, plugins)
+
+	root := f.mkdir(filepath.Join(plugins, "cache", "market", "acme", "1.0.0"))
+	f.write(filepath.Join(root, ".mcp.json"), `{"tools":{"url":"https://relocated.example.com/mcp"}}`)
+	f.write(filepath.Join(plugins, claudeInstalledPluginsFile),
+		`{"plugins":{"acme@market":{"version":"1.0.0"}}}`)
+
+	assertURL(t, Resolve(f.Env, claudeCodeReq("plugin_acme_tools", f.path("proj"))),
+		"https://relocated.example.com/mcp")
 }
 
 // TestClaudeCodePluginMalformedFilesAreSkipped covers the tolerance rule on this
@@ -567,8 +643,8 @@ func TestClaudeCodePluginFileOrder(t *testing.T) {
 
 	want := []string{
 		f.machinePath(claudeManagedMCPDarwin),
-		filepath.Join(project, ".mcp.json"),
 		f.homePath(".claude.json"), // projects[<project>]
+		filepath.Join(project, ".mcp.json"),
 		f.homePath(".claude.json"), // mcpServers
 		filepath.Join(root, ".claude-plugin", "plugin.json"),
 		filepath.Join(root, ".mcp.json"),

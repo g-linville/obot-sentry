@@ -416,8 +416,8 @@ func TestRunReportsPartialIdentityForAMatchedButUnresolvableEntry(t *testing.T) 
 	}}`)
 
 	run := runHook(t, f.Env, hookCase{
-		agent:   "claude-code",
-		event:   "PreToolUse",
+		agent: "claude-code",
+		event: "PreToolUse",
 		// The cwd is encoded, not interpolated: a Windows fixture home is full of
 		// backslashes, and a backslash opens an escape inside a JSON string.
 		payload: string(mustJSON(map[string]string{"tool_name": "mcp__local-binary__do", "cwd": f.Home})),

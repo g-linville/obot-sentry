@@ -24,6 +24,12 @@ const claudeAIDisplayPrefix = "claude.ai "
 // Names beginning with the claude.ai display prefix additionally collapse
 // underscore runs and lose leading and trailing underscores — which is where a
 // connector's "_2" disambiguation comes from. There is no suffix to strip.
+//
+// Claude Code puts the TOOL half of a namespaced name through this same transform,
+// which is why the tool a hook reports is already folded and is forwarded as it
+// arrived rather than transformed again. The consequence lands downstream: a tool
+// whose real name carries anything outside the legal set reaches Obot in its folded
+// spelling, so an allowlist entry written with the real name will not match it.
 func formClaudeCode(name string) string {
 	folded := foldToNamespace(name, true)
 	if strings.HasPrefix(name, claudeAIDisplayPrefix) {

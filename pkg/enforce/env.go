@@ -135,6 +135,10 @@ type configLoader struct {
 	// pluginInstalls is keyed by the working directory the installations were
 	// discovered for, since a project-scoped installation depends on it.
 	pluginInstalls map[string]cachedPluginInstalls
+	// projectFiles caches the project MCP files found above one working directory.
+	// The walk probes every ancestor, so without this an ambiguous tool name — which
+	// resolves once per way it splits — would repeat that walk per reading.
+	projectFiles map[string][]string
 }
 
 type cachedPluginInstalls struct {
@@ -149,6 +153,7 @@ func newConfigLoader() *configLoader {
 		codexServerSets: map[string]cachedServerSet{},
 		claudeDocs:      map[string]cachedClaudeJSON{},
 		pluginInstalls:  map[string]cachedPluginInstalls{},
+		projectFiles:    map[string][]string{},
 	}
 }
 

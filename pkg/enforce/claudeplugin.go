@@ -1,10 +1,12 @@
 package enforce
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"maps"
 	"os"
@@ -12,6 +14,8 @@ import (
 	"slices"
 	"strings"
 	"syscall"
+
+	"gopkg.in/yaml.v3"
 )
 
 // Claude Code plugins declare MCP servers of their own, and a call to one arrives
@@ -35,6 +39,12 @@ const (
 	claudePluginManifestSub = ".claude-plugin/plugin.json"
 	// claudePluginMCPFile is the MCP server file every plugin may carry.
 	claudePluginMCPFile = ".mcp.json"
+	// claudeInstalledPluginsFile is the plugin registry, relative to the plugin tree.
+	// It is the only registry file there is: its contents carry their own version, so
+	// this one name covers every layout the agent reads.
+	claudeInstalledPluginsFile = "installed_plugins.json"
+	// claudeSkillDoc is the document describing a skill directory.
+	claudeSkillDoc = "SKILL.md"
 )
 
 // Bounds on plugin discovery.
@@ -42,7 +52,16 @@ const (
 	maxPluginInstalls        = 256
 	maxSkillDirEntries       = 512
 	maxPluginManifestSources = 8
+	maxSkillDocBytes         = 1 << 20
 )
+
+// claudeSkillManifestKeys are the frontmatter keys that make a skill directory a
+// plugin as well. A directory declaring none of them contributes nothing, however
+// else it is furnished.
+var claudeSkillManifestKeys = [...]string{
+	"mcpServers", "lspServers", "agents", "outputStyles", "themes", "workflows",
+	"channels", "monitors", "settings", "userConfig", "experimental",
+}
 
 // pluginGap is a plugin source the resolver knows is there and could not enumerate:
 // a directory it could not list, a bound it ran into, a registry it could not read.
@@ -69,15 +88,106 @@ func unresolvedPluginGap(serverName string, gap *pluginGap, tr *tracer) Resoluti
 	return res
 }
 
-// claudePluginRegistry is the part of installed_plugins.json the resolver reads. It
-// is keyed "<plugin>@<marketplace>", and a plugin can be installed more than once —
-// once per scope, and once per project for the project scopes.
+// claudePluginRegistry is the part of the plugin registry the resolver reads. It is
+// keyed "<plugin>@<marketplace>".
+//
+// The value is kept raw because it has two shapes across registry versions and a
+// machine can be carrying either: the current one lists every installation of a
+// plugin, and the older one records a single installation as a bare object. Decoding
+// a whole file under one of those shapes would reject the other outright, which for
+// this file means losing the entire plugin set. See pluginInstallRecords.
 type claudePluginRegistry struct {
-	Plugins map[string][]struct {
-		Scope       string `json:"scope"`
-		ProjectPath string `json:"projectPath"`
-		InstallPath string `json:"installPath"`
-	} `json:"plugins"`
+	Plugins map[string]json.RawMessage `json:"plugins"`
+}
+
+// pluginInstallRecord is one installation of one plugin. A plugin can be installed
+// more than once — once per scope, and once per project for the project scopes.
+type pluginInstallRecord struct {
+	ProjectPath string `json:"projectPath"`
+	InstallPath string `json:"installPath"`
+	Version     string `json:"version"`
+}
+
+// pluginInstallRecords decodes one registry entry under whichever shape it has.
+//
+// The older shape does not record where the plugin was installed to; that location
+// is implied by the plugin's identity and version instead. It can sit in the main
+// plugin tree or in any of the seeded ones, so every candidate is returned, and the
+// ones that are not there contribute nothing.
+func pluginInstallRecords(env Env, id string, raw json.RawMessage) []pluginInstallRecord {
+	switch jsonKindOf(raw) {
+	case '[':
+		var records []pluginInstallRecord
+		if json.Unmarshal(raw, &records) != nil {
+			return nil
+		}
+		return records
+	case '{':
+		var record pluginInstallRecord
+		if json.Unmarshal(raw, &record) != nil {
+			return nil
+		}
+		if record.InstallPath != "" {
+			return []pluginInstallRecord{record}
+		}
+		paths := pluginCachePaths(env, id, record.Version)
+		records := make([]pluginInstallRecord, 0, len(paths))
+		for _, path := range paths {
+			records = append(records, pluginInstallRecord{InstallPath: path})
+		}
+		return records
+	}
+	return nil
+}
+
+// pluginCachePaths returns the locations the older registry shape implies a plugin
+// was installed to: under a plugin tree's cache, keyed by marketplace, plugin name,
+// and version, each reduced to a single path segment.
+func pluginCachePaths(env Env, id, version string) []string {
+	name, marketplace, _ := strings.Cut(id, "@")
+	if name == "" {
+		name = id
+	}
+	if marketplace == "" {
+		marketplace = "unknown"
+	}
+	if version == "" {
+		version = "unknown"
+	}
+	rel := filepath.Join("cache",
+		pluginPathSegment(marketplace, false),
+		pluginPathSegment(name, false),
+		pluginPathSegment(version, true))
+
+	roots := append([]string{env.claudePluginsDir()}, env.claudePluginSeedDirs()...)
+	out := make([]string, 0, len(roots))
+	for _, root := range roots {
+		out = append(out, filepath.Join(root, rel))
+	}
+	return out
+}
+
+// pluginPathSegment reduces a value to the single path segment the plugin tree names
+// it with: everything outside letters, digits, hyphen, and underscore becomes a
+// hyphen. A version segment keeps dots too, except that one made of nothing but dots
+// would name a directory relative to its parent rather than a new one.
+func pluginPathSegment(s string, version bool) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	for _, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '-', r == '_':
+			b.WriteRune(r)
+		case version && r == '.':
+			b.WriteRune(r)
+		default:
+			b.WriteByte('-')
+		}
+	}
+	if out := b.String(); out != "." && out != ".." {
+		return out
+	}
+	return "-"
 }
 
 // pluginInstall is one plugin installation on this machine.
@@ -319,31 +429,19 @@ func (l *configLoader) claudePluginInstalls(ctx context.Context, env Env, cwd st
 // between two install paths for one name.
 func registryPluginInstalls(ctx context.Context, loader *configLoader, env Env, cwd string, out []pluginInstall) ([]pluginInstall, *pluginGap) {
 	var reg claudePluginRegistry
-	// The v2 registry supersedes the original where it exists; both hold the same
-	// shape, a plugin id mapping to one installation per scope.
-	path := env.homePath(".claude", "plugins", "installed_plugins_v2.json")
-	res := loader.loadJSON(ctx, path, &reg)
-	if res != loadOK || len(reg.Plugins) == 0 {
-		v2Res := res
-		reg = claudePluginRegistry{}
-		path = env.homePath(".claude", "plugins", "installed_plugins.json")
-		if res = loader.loadJSON(ctx, path, &reg); res != loadOK {
-			// A registry that is merely absent means there is nothing to enumerate. One
-			// that is there and unreadable is a gap and not the ordinary
-			// malformed-config case, because this file is not a source of servers: it
-			// is the index naming every file that is. Losing it hides the whole plugin
-			// set rather than one entry in it.
-			if res == loadUnusable {
-				return out, &pluginGap{path: path, key: "plugins", detail: fmt.Sprintf(
-					"the plugin registry at %s could not be read", path)}
-			}
-			if v2Res == loadUnusable {
-				v2Path := env.homePath(".claude", "plugins", "installed_plugins_v2.json")
-				return out, &pluginGap{path: v2Path, key: "plugins", detail: fmt.Sprintf(
-					"the plugin registry at %s could not be read", v2Path)}
-			}
-			return out, nil
+	// The registry lives in exactly one file, whose contents carry their own version.
+	path := filepath.Join(env.claudePluginsDir(), claudeInstalledPluginsFile)
+	if res := loader.loadJSON(ctx, path, &reg); res != loadOK {
+		// A registry that is merely absent means there is nothing to enumerate. One
+		// that is there and unreadable is a gap and not the ordinary malformed-config
+		// case, because this file is not a source of servers: it is the index naming
+		// every file that is. Losing it hides the whole plugin set rather than one
+		// entry in it.
+		if res == loadUnusable {
+			return out, &pluginGap{path: path, key: "plugins", detail: fmt.Sprintf(
+				"the plugin registry at %s could not be read", path)}
 		}
+		return out, nil
 	}
 
 	dirs := ancestors(cwd)
@@ -360,7 +458,7 @@ func registryPluginInstalls(ctx context.Context, loader *configLoader, env Env, 
 		if name == "" {
 			continue
 		}
-		for _, install := range reg.Plugins[key] {
+		for _, install := range pluginInstallRecords(env, key, reg.Plugins[key]) {
 			root := strings.TrimSpace(install.InstallPath)
 			if root == "" || !filepath.IsAbs(root) {
 				continue
@@ -387,12 +485,20 @@ func registryPluginInstalls(ctx context.Context, loader *configLoader, env Env, 
 }
 
 // skillsDirPluginInstalls appends the pseudo-plugins Claude Code synthesizes from
-// skill directories. They appear in no registry — the agent builds one per directory
-// under the global and project skills roots, named for the directory — and they carry
-// no manifest, so a .mcp.json in the directory is all there is to read.
+// skill directories. They appear in no registry — the agent builds one per
+// qualifying directory under the global and project skills roots, named for the
+// directory — and they carry no manifest, so a .mcp.json in the directory is all
+// there is to read.
+//
+// A directory qualifies only when its skill document declares at least one plugin
+// manifest key. A skill that is only a skill never becomes a plugin, so treating one
+// as a plugin would let a server file that never loads answer for a call.
 func skillsDirPluginInstalls(env Env, cwd string, out []pluginInstall) ([]pluginInstall, *pluginGap) {
-	roots := []string{env.homePath(".claude", "skills")}
-	if dir := nearestSkillsDir(cwd); dir != "" {
+	roots := []string{env.claudeSkillsDir()}
+	// The project root is the working directory's own, with no walk above it: the
+	// agent looks where it was launched and nowhere else. See projectsKey on why that
+	// directory is the best anchor a hook payload can offer.
+	if dir := projectSkillsDir(cwd); dir != "" {
 		roots = append(roots, dir)
 	}
 	seen := make(map[string]struct{}, len(roots))
@@ -417,40 +523,86 @@ func skillsDirPluginInstalls(env Env, cwd string, out []pluginInstall) ([]plugin
 		}
 
 		for _, entry := range entries {
-			if !entry.IsDir() {
+			// A symlinked directory counts too, which is how one skill tree is
+			// commonly shared between projects.
+			if !entry.IsDir() && entry.Type()&fs.ModeSymlink == 0 {
+				continue
+			}
+			dir := filepath.Join(root, entry.Name())
+			if !skillDirDeclaresPlugin(dir) {
 				continue
 			}
 			if len(out) == maxPluginInstalls {
 				return out, &pluginGap{path: root, detail: fmt.Sprintf(
 					"more than %d plugin installations were found", maxPluginInstalls)}
 			}
-			out = append(out, pluginInstall{
-				name: entry.Name(),
-				root: filepath.Join(root, entry.Name()),
-			})
+			out = append(out, pluginInstall{name: entry.Name(), root: dir})
 		}
 	}
 	return out, nil
+}
+
+// skillDirDeclaresPlugin reports whether a skill directory declares a plugin as
+// well, which is what makes its server file live.
+func skillDirDeclaresPlugin(dir string) bool {
+	front, ok := skillFrontmatter(filepath.Join(dir, claudeSkillDoc))
+	if !ok {
+		return false
+	}
+	for _, key := range claudeSkillManifestKeys {
+		// A key that is present but empty declares nothing, same as one left out.
+		if value, present := front[key]; present && value != nil {
+			return true
+		}
+	}
+	return false
+}
+
+// skillFrontmatter decodes the leading YAML block of a skill document. A document
+// that is missing, unreadable, oversized, or carrying no parsable block declares
+// nothing.
+func skillFrontmatter(path string) (map[string]any, bool) {
+	f, err := openConfigFile(path)
+	if err != nil {
+		return nil, false
+	}
+	defer func() { _ = f.Close() }()
+
+	info, err := f.Stat()
+	if err != nil || !info.Mode().IsRegular() || info.Size() > maxSkillDocBytes {
+		return nil, false
+	}
+	data, err := io.ReadAll(io.LimitReader(f, maxSkillDocBytes))
+	if err != nil {
+		return nil, false
+	}
+
+	doc := strings.TrimLeft(string(bytes.TrimPrefix(data, utf8BOM)), " \t\r\n")
+	if !strings.HasPrefix(doc, "---") {
+		return nil, false
+	}
+	block, _, found := strings.Cut(strings.TrimLeft(doc[3:], "\r\n"), "\n---")
+	if !found {
+		return nil, false
+	}
+	var front map[string]any
+	if err := yaml.Unmarshal([]byte(block), &front); err != nil || front == nil {
+		return nil, false
+	}
+	return front, true
 }
 
 func isNotDirectory(err error) bool {
 	return errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ENOTDIR)
 }
 
-// nearestSkillsDir returns the .claude/skills directory of the first ancestor of cwd
-// that has one, mirroring nearestProjectFileDir. Unlike that one it returns nothing
-// when there is none: an absent skills directory contributes no plugin, so there is
-// no source for the trace to name.
-func nearestSkillsDir(cwd string) string {
-	for _, dir := range ancestors(cwd) {
-		candidate := filepath.Join(dir, ".claude", "skills")
-		info, err := os.Lstat(candidate)
-		switch {
-		case err == nil && info.IsDir():
-			return candidate
-		case err != nil && !isNotDirectory(err):
-			return candidate
-		}
+// projectSkillsDir is the project skills root for a call made from cwd, or nothing
+// when cwd cannot identify one. An absent skills directory contributes no plugin, so
+// there is no source for the trace to name.
+func projectSkillsDir(cwd string) string {
+	cwd = strings.TrimSpace(cwd)
+	if cwd == "" || !filepath.IsAbs(cwd) {
+		return ""
 	}
-	return ""
+	return filepath.Join(filepath.Clean(cwd), ".claude", "skills")
 }

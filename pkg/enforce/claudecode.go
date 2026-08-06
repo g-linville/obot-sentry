@@ -12,13 +12,31 @@ import (
 // Claude Code configuration file locations. Linux is deliberately absent
 // throughout: obot-sentry builds for darwin and windows only, and
 // hookinstall.supportedPlatform rejects everything else.
+//
+// Both machine-scoped paths are spelled slash-separated so machinePath can convert
+// them, and neither is looked up in the environment. That is not a simplification:
+// the agent compiles one fixed location per platform in and never consults
+// %PROGRAMFILES%, so reading it here would point at a file the agent does not read.
 const (
-	claudeManagedMCPDarwin = "/Library/Application Support/ClaudeCode/managed-mcp.json"
-	// windowsProgramFilesDefault stands in for %PROGRAMFILES% when it is unset,
-	// which happens when a test models the Windows layout from another OS.
-	windowsProgramFilesDefault = `C:\Program Files`
+	claudeManagedMCPDarwin  = "/Library/Application Support/ClaudeCode/managed-mcp.json"
+	claudeManagedMCPWindows = "C:/Program Files/ClaudeCode/managed-mcp.json"
 	// claudeAIConnectorPrefix namespaces a claude.ai account connector's tools.
 	claudeAIConnectorPrefix = "claude_ai_"
+	// claudeProjectMCPFile is the project-scoped server file, read from the working
+	// directory and from every directory above it.
+	claudeProjectMCPFile = ".mcp.json"
+)
+
+// Environment variables that relocate Claude Code's own state.
+//
+// Each is honored only when it holds an absolute path. A relative one cannot be
+// resolved from here, because it would be taken against the agent's working
+// directory rather than the hook's, and guessing wrong would point every lookup at
+// a tree that does not exist.
+const (
+	claudeConfigDirEnv      = "CLAUDE_CONFIG_DIR"
+	claudePluginCacheDirEnv = "CLAUDE_CODE_PLUGIN_CACHE_DIR"
+	claudePluginSeedDirEnv  = "CLAUDE_CODE_PLUGIN_SEED_DIR"
 )
 
 // claudeJSON is the part of ~/.claude.json the resolver reads.
@@ -57,15 +75,92 @@ func (l *configLoader) loadClaudeJSON(ctx context.Context, path string) (claudeJ
 // managedMCPPath returns the enterprise managed MCP configuration path.
 func (e Env) managedMCPPath() string {
 	if e.windows() {
-		return e.envPath("PROGRAMFILES", windowsProgramFilesDefault, "ClaudeCode", "managed-mcp.json")
+		return e.machinePath(claudeManagedMCPWindows)
 	}
 	return e.machinePath(claudeManagedMCPDarwin)
+}
+
+// envDir returns the absolute directory held by an environment variable, or empty.
+func (e Env) envDir(key string) string {
+	dir := strings.TrimSpace(e.getenv(key))
+	if dir == "" || !filepath.IsAbs(dir) {
+		return ""
+	}
+	return filepath.Clean(dir)
+}
+
+// claudeConfigDir is the directory Claude Code keeps its per-user state in: the
+// installed plugins, the skills tree, and the user settings file. An override in
+// the environment relocates the whole tree.
+func (e Env) claudeConfigDir() string {
+	if dir := e.envDir(claudeConfigDirEnv); dir != "" {
+		return dir
+	}
+	return e.homePath(".claude")
+}
+
+// claudeJSONPath is the file holding Claude Code's user-scoped server table and its
+// per-project tables.
+//
+// Two things make this more than a fixed name. An alternate file inside the config
+// directory takes precedence whenever it exists, so a machine carrying one is
+// reading a different file entirely. And the config directory override moves this
+// file too — but to a sibling of that directory rather than inside it, which is why
+// the override is applied here directly instead of through claudeConfigDir.
+func (e Env) claudeJSONPath() string {
+	if alt := filepath.Join(e.claudeConfigDir(), ".config.json"); existsAsFile(alt) {
+		return alt
+	}
+	if dir := e.envDir(claudeConfigDirEnv); dir != "" {
+		return filepath.Join(dir, ".claude.json")
+	}
+	return e.homePath(".claude.json")
+}
+
+// claudePluginsDir is the root of the installed-plugin tree. It has an override of
+// its own, which wins over the config directory.
+func (e Env) claudePluginsDir() string {
+	if dir := e.envDir(claudePluginCacheDirEnv); dir != "" {
+		return dir
+	}
+	return filepath.Join(e.claudeConfigDir(), "plugins")
+}
+
+// claudeSkillsDir is the user-scoped skills root.
+func (e Env) claudeSkillsDir() string {
+	return filepath.Join(e.claudeConfigDir(), "skills")
+}
+
+// claudePluginSeedDirs are the seeded plugin trees named by the environment as a
+// list in the platform's path-list form. Each holds the same cache layout as the
+// main plugin tree and is consulted when an installation records no location of its
+// own — see pluginCachePaths.
+func (e Env) claudePluginSeedDirs() []string {
+	raw := strings.TrimSpace(e.getenv(claudePluginSeedDirEnv))
+	if raw == "" {
+		return nil
+	}
+	var out []string
+	for _, dir := range filepath.SplitList(raw) {
+		if dir = strings.TrimSpace(dir); dir != "" && filepath.IsAbs(dir) {
+			out = append(out, filepath.Clean(dir))
+		}
+	}
+	return out
+}
+
+// existsAsFile reports whether path is present and is not a directory. It is a
+// presence probe rather than a read: the caller only needs to know whether the file
+// is there before deciding to name it as a source.
+func existsAsFile(path string) bool {
+	info, err := os.Lstat(path)
+	return err == nil && !info.IsDir()
 }
 
 // resolveClaudeCode resolves a Claude Code server name against its MCP
 // configuration, then against the claude.ai account connectors.
 func resolveClaudeCode(ctx context.Context, loader *configLoader, env Env, req ResolveRequest, serverName string, tr *tracer) Resolution {
-	claudePath := env.homePath(".claude.json")
+	claudePath := env.claudeJSONPath()
 	claude, claudeRes := loader.loadClaudeJSON(ctx, claudePath)
 
 	// Most Claude Code keys survive namespacing untouched — hyphens and underscores
@@ -85,6 +180,18 @@ func resolveClaudeCode(ctx context.Context, loader *configLoader, env Env, req R
 		// The managed lockdown stops plugin servers from running at all, so an
 		// incompletely enumerated plugin tree cannot change this answer and is not
 		// worth reporting over it.
+		//
+		// The claude.ai account connectors are the one exception, and they are not
+		// suppressed unconditionally: an administrator can opt back into them
+		// alongside the managed configuration. That opt-in lives in managed settings
+		// this hook cannot read in full — some of it is outside any file it could
+		// parse — so a name that matches a connector this installation has connected
+		// to is reported as undecidable rather than guessed in either direction.
+		if connector, ok := resolveClaudeAIConnector(claude, claudeRes, claudePath, serverName, tr); ok {
+			return unresolved(connector, fmt.Sprintf(
+				"MCP server %q is not in Claude Code's managed MCP configuration, but it names a claude.ai connector this installation has connected to, and whether the managed configuration suppresses that connector depends on a managed setting the hook cannot read",
+				serverName))
+		}
 		return notFound(req.Agent, serverName, fmt.Sprintf(
 			"MCP server %q is not in Claude Code's managed MCP configuration, which cannot be overridden", serverName))
 	}
@@ -114,8 +221,10 @@ func resolveClaudeCode(ctx context.Context, loader *configLoader, env Env, req R
 }
 
 // claudeCodeScopes returns the Claude Code MCP configuration scopes, highest
-// precedence first: the managed config, then the project-scoped sources, then the
-// global servers table, then the installed plugins.
+// precedence first: the managed config, the working directory's own entry in the
+// user config, the project files at and above the working directory, the user-wide
+// servers table, and last the installed plugins.
+//
 // It also reports a plugin source that exists and could not be enumerated, which
 // denies rather than falling through — see pluginGap.
 func claudeCodeScopes(ctx context.Context, loader *configLoader, env Env, cwd, serverName, claudePath string, claude claudeJSON, claudeRes loadResult) ([]scope, *pluginGap) {
@@ -128,6 +237,8 @@ func claudeCodeScopes(ctx context.Context, loader *configLoader, env Env, cwd, s
 	// returns the managed set before plugin discovery runs at all, and the one
 	// documented escape from the lockdown covers claude.ai connectors only. A
 	// managed file therefore ends a plugin call here as well, with the same reason.
+	// The connector escape is handled where the closed outcome is answered, in
+	// resolveClaudeCode.
 	scopes := []scope{{
 		path:   managedPath,
 		key:    mcpServersKey,
@@ -135,97 +246,128 @@ func claudeCodeScopes(ctx context.Context, loader *configLoader, env Env, cwd, s
 		load:   jsonServers(loader, managedPath),
 	}}
 
-	// projectScopes hands out one consecutive rank per scope from the one it is
-	// given, so the global table sits just below the last of them.
-	project := projectScopes(loader, env, cwd, claudePath, claude, claudeRes, 1)
-	scopes = append(scopes, project...)
+	// The working directory's own entry in the user config outranks the project
+	// files. It is the private per-project table, and the agent lets it overwrite
+	// anything a checked-in project file declares.
+	if key, ok := projectsKey(env, claude, cwd); ok {
+		scopes = append(scopes, scope{
+			path: claudePath,
+			key:  fmt.Sprintf("projects[%q].%s", key, mcpServersKey),
+			load: fixedServers(decodeServers(claude.Projects[key].MCPServers), claudeRes),
+		})
+	}
 
-	globalRank := 1 + len(project)
+	for _, path := range loader.projectFilePaths(cwd) {
+		scopes = append(scopes, scope{
+			path: path,
+			key:  mcpServersKey,
+			load: jsonServers(loader, path),
+		})
+	}
+
 	scopes = append(scopes, scope{
 		path: claudePath,
 		key:  mcpServersKey,
-		rank: globalRank,
 		load: fixedServers(decodeServers(claude.MCPServers), claudeRes),
 	})
+
+	// Every scope so far is a singleton, so position is precedence.
+	for i := range scopes {
+		scopes[i].rank = i
+	}
 
 	// Plugins rank last. The agent merges their servers first and lets user, project,
 	// and local configuration overwrite them by key, and nothing reserves the plugin
 	// namespace against a user writing one of its names by hand — so a name declared
 	// in both places is the user's, not the plugin's.
-	plugin, gap := claudePluginScopes(ctx, loader, env, cwd, serverName, globalRank+1)
+	plugin, gap := claudePluginScopes(ctx, loader, env, cwd, serverName, len(scopes))
 	return append(scopes, plugin...), gap
 }
 
 // maxProjectDepth bounds the ancestor walk.
 const maxProjectDepth = 40
 
-// projectScopes returns the project-scoped Claude Code sources that may govern a
-// call made from cwd, most specific first.
+// projectsKey returns the key in the user config's per-project table that names the
+// working directory, if there is one.
 //
-// Claude Code keys projects{} by the directory it was launched in, which is
-// frequently not a repository root, and reads .mcp.json from its project root.
-// Both are found by walking cwd's ancestors: within one directory the project
-// file outranks the projects{} entry, and a deeper directory outranks a shallower
-// one. Only the nearest .mcp.json is a scope, because only one project root is
-// ever live for a session.
-func projectScopes(loader *configLoader, env Env, cwd, claudePath string, claude claudeJSON, claudeRes loadResult, rank int) []scope {
-	dirs := ancestors(cwd)
-	if len(dirs) == 0 {
-		return nil
+// That table is keyed by the directory the agent was launched in, and exactly one
+// key is ever read: the one naming that directory. An enclosing directory's entry
+// belongs to a different session and never governs this call, so it is not consulted.
+//
+// The directory here comes from the hook payload, which carries the agent's current
+// working directory. That is the same directory in the ordinary case but not always:
+// the agent anchors its configuration on the directory it started in, and a session
+// whose working directory has since moved will disagree. The payload carries no way
+// to recover the original, so the current directory is the best anchor available.
+// TODO(g-linville): see if there is something we can do about this.
+func projectsKey(env Env, claude claudeJSON, cwd string) (string, bool) {
+	cwd = strings.TrimSpace(cwd)
+	if cwd == "" || !filepath.IsAbs(cwd) {
+		return "", false
 	}
+	want := env.comparableDir(cwd)
 
-	keyByDir := make(map[string]string, len(claude.Projects))
+	var found string
 	for key := range claude.Projects {
-		dir := env.comparableDir(key)
-		if dir == "" {
+		if env.comparableDir(key) != want {
 			continue
 		}
 		// Two keys can name one directory through spelling alone. Taking the lowest
 		// keeps resolution stable across runs, since map order is not.
-		if existing, ok := keyByDir[dir]; !ok || key < existing {
-			keyByDir[dir] = key
+		// TODO(g-linville): could this cause shadowing?
+		if found == "" || key < found {
+			found = key
 		}
 	}
-
-	projectFileDir := nearestProjectFileDir(dirs)
-	scopes := make([]scope, 0, 4)
-	for _, dir := range dirs {
-		if dir == projectFileDir {
-			path := filepath.Join(dir, ".mcp.json")
-			scopes = append(scopes, scope{
-				path: path,
-				key:  mcpServersKey,
-				rank: rank,
-				load: jsonServers(loader, path),
-			})
-			rank++
-		}
-		key, ok := keyByDir[env.comparableDir(dir)]
-		if !ok {
-			continue
-		}
-		scopes = append(scopes, scope{
-			path: claudePath,
-			key:  fmt.Sprintf("projects[%q].%s", key, mcpServersKey),
-			rank: rank,
-			load: fixedServers(decodeServers(claude.Projects[key].MCPServers), claudeRes),
-		})
-		rank++
-	}
-	return scopes
+	return found, found != ""
 }
 
-// nearestProjectFileDir returns the first directory in dirs holding a .mcp.json.
-// With none, it returns dirs[0] anyway, so that the file an operator expects to
-// be read is named in the trace as absent rather than going unmentioned.
-func nearestProjectFileDir(dirs []string) string {
-	for _, dir := range dirs {
-		info, err := os.Lstat(filepath.Join(dir, ".mcp.json"))
-		if err == nil && !info.IsDir() {
-			return dir
+// projectFilePaths returns the project MCP files for cwd, caching them for the
+// lifetime of one resolution.
+func (l *configLoader) projectFilePaths(cwd string) []string {
+	if cached, ok := l.projectFiles[cwd]; ok {
+		return cached
+	}
+	paths := projectFilePaths(cwd)
+	l.projectFiles[cwd] = paths
+	return paths
+}
+
+// projectFilePaths returns the project MCP files that may govern a call made from
+// cwd, nearest first.
+//
+// Every directory from the working directory upwards can hold one and the agent
+// reads them all, letting a nearer file overwrite a farther one. Consecutive ranks
+// in this order say exactly that. The volume root is left out, which is where the
+// agent's own walk stops.
+//
+// With no file anywhere, the working directory's own path is returned regardless, so
+// that the file an operator expects to be read is named in the trace as absent
+// rather than going unmentioned.
+func projectFilePaths(cwd string) []string {
+	paths := make([]string, 0, 4)
+	nearest := ""
+	for _, dir := range ancestors(cwd) {
+		if isVolumeRoot(dir) {
+			continue
+		}
+		path := filepath.Join(dir, claudeProjectMCPFile)
+		if nearest == "" {
+			nearest = path
+		}
+		if existsAsFile(path) {
+			paths = append(paths, path)
 		}
 	}
-	return dirs[0]
+	if len(paths) == 0 && nearest != "" {
+		return []string{nearest}
+	}
+	return paths
+}
+
+// isVolumeRoot reports whether dir is the top of its volume.
+func isVolumeRoot(dir string) bool {
+	return filepath.Dir(dir) == dir
 }
 
 // ancestors returns an absolute cwd and each directory above it, nearest first.
@@ -250,16 +392,27 @@ func ancestors(cwd string) []string {
 
 // comparableDir is the form of a directory path used to decide whether two paths
 // name the same directory.
+//
+// On Windows the per-project table's keys are written with forward slashes, so
+// separators are unified before cleaning; doing it in that order means both sides
+// come out spelled the same whether this runs on Windows or on a host modeling it.
+// A backslash is a legal filename character elsewhere, so this is confined to
+// Windows.
+//
+// Case is folded there too, which the agent does not do — it writes and reads those
+// keys through one function and so never sees a case difference, while the directory
+// here arrives from a hook payload that may spell it differently. Folding is the
+// tolerant side of that, and it is safe because only the one working directory is
+// ever looked up.
 func (e Env) comparableDir(path string) string {
 	path = strings.TrimSpace(path)
 	if path == "" {
 		return ""
 	}
-	path = filepath.Clean(path)
 	if e.windows() {
-		return strings.ToLower(path)
+		return strings.ToLower(filepath.Clean(strings.ReplaceAll(path, `\`, "/")))
 	}
-	return path
+	return filepath.Clean(path)
 }
 
 func resolveClaudeAIConnector(claude claudeJSON, claudeRes loadResult, claudePath, serverName string, tr *tracer) (string, bool) {

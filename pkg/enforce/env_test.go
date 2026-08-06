@@ -124,11 +124,10 @@ func TestMachinePathIsAbsoluteInProduction(t *testing.T) {
 
 	// Since nothing is prepended, what comes back is absolute wherever the path
 	// given belongs. Those above are the macOS locations, which are absolute on
-	// macOS; on Windows the equivalent is the drive-letter fallback %PROGRAMFILES%
-	// stands in for.
+	// macOS; on Windows the equivalent is the drive-letter path.
 	native, nativeEnv := claudeManagedMCPDarwin, env
 	if runtime.GOOS == "windows" {
-		native, nativeEnv.GOOS = windowsProgramFilesDefault, "windows"
+		native, nativeEnv.GOOS = claudeManagedMCPWindows, "windows"
 	}
 	if got := nativeEnv.machinePath(native); !filepath.IsAbs(got) {
 		t.Errorf("machinePath(%q) = %q, want an absolute path", native, got)
