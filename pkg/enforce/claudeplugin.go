@@ -35,9 +35,6 @@ const (
 	claudePluginManifestSub = ".claude-plugin/plugin.json"
 	// claudePluginMCPFile is the MCP server file every plugin may carry.
 	claudePluginMCPFile = ".mcp.json"
-	// claudeSkillsDirSource is the marketplace Claude Code gives the pseudo-plugins it
-	// synthesizes from skill directories.
-	claudeSkillsDirSource = "skills-dir"
 )
 
 // Bounds on plugin discovery.
@@ -87,10 +84,8 @@ type claudePluginRegistry struct {
 type pluginInstall struct {
 	// name is the plugin name, which is the middle segment of its server keys.
 	name string
-	// source is "<plugin>@<marketplace>", which is what the plugin data directory is
-	// named after.
-	source string
-	// root is the absolute install directory, and the value of ${CLAUDE_PLUGIN_ROOT}.
+	// root is the absolute install directory. It is where the plugin's own files are
+	// read from; it is deliberately not substituted into its entries, see namespaced.
 	root string
 }
 
@@ -98,12 +93,6 @@ type pluginInstall struct {
 // carry.
 func (in pluginInstall) namespacePrefix() string {
 	return formClaudeCode(claudePluginKeyPrefix + in.name + ":")
-}
-
-// dataDir is ${CLAUDE_PLUGIN_DATA}: the plugin's writable directory, named for its
-// source with the marketplace separator flattened.
-func (in pluginInstall) dataDir(env Env) string {
-	return env.homePath(".claude", "plugins", "data", strings.ReplaceAll(in.source, "@", "-"))
 }
 
 // resolveRel resolves a manifest-declared path against the plugin root.
@@ -129,43 +118,13 @@ func (in pluginInstall) resolveRel(rel string) (string, bool) {
 }
 
 // namespaced rewrites a plugin's own server table into the keys the agent uses for
-// it, substituting the plugin variables on the way through.
-func (in pluginInstall) namespaced(set serverSet, subst func(*mcpEntry)) serverSet {
+// it.
+func (in pluginInstall) namespaced(set serverSet) serverSet {
 	out := make(serverSet, len(set))
 	for name, entry := range set {
-		if subst != nil {
-			subst(&entry)
-		}
 		out[claudePluginKeyPrefix+in.name+":"+name] = entry
 	}
 	return out
-}
-
-// substitutePluginVars returns the variable substitution Claude Code applies to a
-// plugin's server entries, over the fields the resolver reads.
-// Only the plugin-scoped variables are handled.
-func substitutePluginVars(env Env, in pluginInstall, cwd string) func(*mcpEntry) {
-	pairs := []string{
-		"${CLAUDE_PLUGIN_ROOT}", in.root,
-		"${CLAUDE_PLUGIN_DATA}", in.dataDir(env),
-	}
-	// An empty cwd names no project directory, and substituting the empty string
-	// would turn a path into a wrong one. Leaving the variable intact keeps it
-	// visibly unresolved instead.
-	if cwd = strings.TrimSpace(cwd); cwd != "" {
-		pairs = append(pairs, "${CLAUDE_PROJECT_DIR}", filepath.Clean(cwd))
-	}
-	r := strings.NewReplacer(pairs...)
-	return func(e *mcpEntry) {
-		e.Command = r.Replace(e.Command)
-		e.URL = r.Replace(e.URL)
-		for i, arg := range e.Args {
-			e.Args[i] = r.Replace(arg)
-		}
-		for key, value := range e.Environment {
-			e.Environment[key] = r.Replace(value)
-		}
-	}
 }
 
 // claudePluginScopes returns the scopes contributed by this machine's Claude Code
@@ -187,8 +146,7 @@ func claudePluginScopes(ctx context.Context, loader *configLoader, env Env, cwd,
 		if !strings.HasPrefix(serverName, in.namespacePrefix()) {
 			continue
 		}
-		subst := substitutePluginVars(env, in, cwd)
-		manifestScopes, manifestGap := pluginManifestScopes(ctx, loader, in, subst, rank)
+		manifestScopes, manifestGap := pluginManifestScopes(ctx, loader, in, rank)
 		gap = firstGap(gap, manifestGap)
 		manifests = append(manifests, manifestScopes...)
 		path := filepath.Join(in.root, claudePluginMCPFile)
@@ -196,7 +154,7 @@ func claudePluginScopes(ctx context.Context, loader *configLoader, env Env, cwd,
 			path: path,
 			key:  mcpServersKey,
 			rank: rank + 1,
-			load: pluginServers(loader, in, subst, path),
+			load: pluginServers(loader, in, path),
 		})
 	}
 	return append(manifests, files...), gap
@@ -209,7 +167,7 @@ func claudePluginScopes(ctx context.Context, loader *configLoader, env Env, cwd,
 // file that was never going to say anything is noise. A declaration we cannot follow
 // does contribute one, loading as unusable, because a source silently dropped is the
 // one thing a resolution trace must never do.
-func pluginManifestScopes(ctx context.Context, loader *configLoader, in pluginInstall, subst func(*mcpEntry), rank int) ([]scope, *pluginGap) {
+func pluginManifestScopes(ctx context.Context, loader *configLoader, in pluginInstall, rank int) ([]scope, *pluginGap) {
 	manifestPath := filepath.Join(in.root, filepath.FromSlash(claudePluginManifestSub))
 	var doc struct {
 		MCPServers json.RawMessage `json:"mcpServers"`
@@ -246,7 +204,7 @@ func pluginManifestScopes(ctx context.Context, loader *configLoader, in pluginIn
 				path: manifestPath,
 				key:  mcpServersKey,
 				rank: rank,
-				load: fixedServers(in.namespaced(decodeServers(servers), subst), loadOK),
+				load: fixedServers(in.namespaced(decodeServers(servers)), loadOK),
 			})
 		case '"':
 			var rel string
@@ -263,7 +221,7 @@ func pluginManifestScopes(ctx context.Context, loader *configLoader, in pluginIn
 				path: path,
 				key:  mcpServersKey,
 				rank: rank,
-				load: pluginServers(loader, in, subst, path),
+				load: pluginServers(loader, in, path),
 			})
 		default:
 			out = append(out, unusable)
@@ -307,7 +265,7 @@ func jsonKindOf(raw json.RawMessage) byte {
 // resolver tolerates JSONC — a file we refuse to read becomes an unresolved call, and
 // an unresolved call is denied. It also means a bare-map server named "mcpServers" is
 // misread as the wrapper, which is exactly what the agent does with it.
-func pluginServers(loader *configLoader, in pluginInstall, subst func(*mcpEntry), path string) func(context.Context) (serverSet, loadResult) {
+func pluginServers(loader *configLoader, in pluginInstall, path string) func(context.Context) (serverSet, loadResult) {
 	return func(ctx context.Context) (serverSet, loadResult) {
 		if ctx.Err() != nil {
 			return nil, loadUnusable
@@ -327,7 +285,7 @@ func pluginServers(loader *configLoader, in pluginInstall, subst func(*mcpEntry)
 		if ctx.Err() != nil {
 			return nil, loadUnusable
 		}
-		return in.namespaced(decodeServers(raw), subst), loadOK
+		return in.namespaced(decodeServers(raw)), loadOK
 	}
 }
 
@@ -422,7 +380,7 @@ func registryPluginInstalls(ctx context.Context, loader *configLoader, env Env, 
 					maxPluginInstalls, path)}
 			}
 			seen[name+"\x00"+root] = struct{}{}
-			out = append(out, pluginInstall{name: name, source: key, root: root})
+			out = append(out, pluginInstall{name: name, root: root})
 		}
 	}
 	return out, nil
@@ -467,9 +425,8 @@ func skillsDirPluginInstalls(env Env, cwd string, out []pluginInstall) ([]plugin
 					"more than %d plugin installations were found", maxPluginInstalls)}
 			}
 			out = append(out, pluginInstall{
-				name:   entry.Name(),
-				source: entry.Name() + "@" + claudeSkillsDirSource,
-				root:   filepath.Join(root, entry.Name()),
+				name: entry.Name(),
+				root: filepath.Join(root, entry.Name()),
 			})
 		}
 	}

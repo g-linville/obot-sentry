@@ -164,25 +164,6 @@ func TestClaudeCodePluginManifestSourcesAreBounded(t *testing.T) {
 	assertURL(t, Resolve(f.Env, claudeCodeReq("plugin_acme_s0", f.path("proj"))), "https://s0.example.com/mcp")
 }
 
-// TestClaudeCodePluginRootSubstitution covers the plugin-scoped variables, which are
-// the difference between a real command and a literal ${...}.
-func TestClaudeCodePluginRootSubstitution(t *testing.T) {
-	f := newFixture(t, "darwin")
-	root := f.installPlugin("acme@market")
-	f.write(filepath.Join(root, ".mcp.json"),
-		`{"tools":{"command":"${CLAUDE_PLUGIN_ROOT}/bin/server","args":["--data","${CLAUDE_PLUGIN_DATA}","--project","${CLAUDE_PROJECT_DIR}"]}}`)
-
-	project := f.path("proj")
-	res := Resolve(f.Env, claudeCodeReq("plugin_acme_tools", project))
-
-	// A path is not a package runner, so this is unresolved-with-command — which is
-	// exactly the state that proves the substitution happened before identification.
-	assertUnresolved(t, res, "is a path, not a bare package runner")
-	if want := filepath.Join(root, "bin", "server"); res.Identity.Command != want {
-		t.Fatalf("command = %q, want %q\n%s", res.Identity.Command, want, resolveTrace(res))
-	}
-}
-
 // TestClaudeCodePluginNamespaceFolding covers a plugin and a server whose names do
 // not survive namespacing, which is the case an exact-match lookup would miss.
 func TestClaudeCodePluginNamespaceFolding(t *testing.T) {
@@ -296,20 +277,6 @@ func TestClaudeCodePluginSkillsDir(t *testing.T) {
 	res := Resolve(f.Env, claudeCodeReq("plugin_deploy_deploy", project))
 	if last := res.Trace[len(res.Trace)-1]; last.Path != filepath.Join(local, ".mcp.json") {
 		t.Fatalf("expected the match on the skill's own file:\n%s", resolveTrace(res))
-	}
-}
-
-// TestClaudeCodePluginSkillsDirDataPath covers the data directory a skills
-// pseudo-plugin gets, which is named for its synthetic marketplace.
-func TestClaudeCodePluginSkillsDirDataPath(t *testing.T) {
-	f := newFixture(t, "darwin")
-	skill := f.mkdir(f.homePath(".claude", "skills", "notes"))
-	f.write(filepath.Join(skill, ".mcp.json"), `{"notes":{"command":"${CLAUDE_PLUGIN_DATA}/run"}}`)
-
-	res := Resolve(f.Env, claudeCodeReq("plugin_notes_notes", f.path("proj")))
-	want := f.homePath(".claude", "plugins", "data", "notes-skills-dir", "run")
-	if res.Identity.Command != want {
-		t.Fatalf("command = %q, want %q\n%s", res.Identity.Command, want, resolveTrace(res))
 	}
 }
 
