@@ -8,8 +8,8 @@ import (
 
 // fixedScope builds a scope serving set, for exercising the engine without a
 // filesystem.
-func fixedScope(name string, rank int, set serverSet) scope {
-	return scope{path: name, key: mcpServersKey, rank: rank, load: fixedServers(set, loadOK)}
+func fixedScope(name string, set serverSet) scope {
+	return scope{path: name, key: mcpServersKey, load: fixedServers(set, loadOK)}
 }
 
 func urlSet(name, url string) serverSet {
@@ -20,57 +20,10 @@ func exactly(name string) lookup {
 	return lookup{names: []string{name}}
 }
 
-func TestResolveScopesRankOrder(t *testing.T) {
+func TestResolveScopesMultipleSourcesAreAmbiguous(t *testing.T) {
 	scopes := []scope{
-		fixedScope("high", 0, urlSet("linear", "https://high.example.com/sse")),
-		fixedScope("low", 1, urlSet("linear", "https://low.example.com/sse")),
-	}
-
-	m, out := resolveScopes(t.Context(), scopes, exactly("linear"), &tracer{})
-	if out != outcomeFound {
-		t.Fatalf("outcome = %v, want outcomeFound", out)
-	}
-	if m.entry.URL != "https://high.example.com/sse" {
-		t.Fatalf("URL = %q, want the lower rank to win", m.entry.URL)
-	}
-}
-
-// TestResolveScopesStopsAtTheFirstRankThatMatches covers the rule that makes rank
-// the whole of precedence: a lower rank is never even loaded once a higher one has
-// answered.
-func TestResolveScopesStopsAtTheFirstRankThatMatches(t *testing.T) {
-	loaded := false
-	scopes := []scope{
-		fixedScope("high", 0, urlSet("linear", "https://high.example.com/sse")),
-		{path: "low", key: mcpServersKey, rank: 1, load: func(context.Context) (serverSet, loadResult) {
-			loaded = true
-			return urlSet("linear", "https://low.example.com/sse"), loadOK
-		}},
-	}
-
-	if _, out := resolveScopes(t.Context(), scopes, exactly("linear"), &tracer{}); out != outcomeFound {
-		t.Fatalf("outcome = %v, want outcomeFound", out)
-	}
-	if loaded {
-		t.Fatal("a lower-ranked scope was loaded after a higher one answered")
-	}
-}
-
-func TestResolveScopesMiss(t *testing.T) {
-	scopes := []scope{fixedScope("only", 0, urlSet("github", "https://github.example.com/sse"))}
-
-	if _, out := resolveScopes(t.Context(), scopes, exactly("linear"), &tracer{}); out != outcomeMiss {
-		t.Fatalf("outcome = %v, want outcomeMiss", out)
-	}
-}
-
-// TestResolveScopesPeersThatConflict covers the reason peers exist: with nothing
-// to order two scopes, a name they define differently cannot be resolved by
-// picking one.
-func TestResolveScopesPeersThatConflict(t *testing.T) {
-	scopes := []scope{
-		fixedScope("a", 0, urlSet("linear", "https://a.example.com/sse")),
-		fixedScope("b", 0, urlSet("linear", "https://b.example.com/sse")),
+		fixedScope("first", urlSet("linear", "https://first.example.com/sse")),
+		fixedScope("second", urlSet("linear", "https://second.example.com/sse")),
 	}
 
 	if _, out := resolveScopes(t.Context(), scopes, exactly("linear"), &tracer{}); out != outcomeAmbiguous {
@@ -78,25 +31,56 @@ func TestResolveScopesPeersThatConflict(t *testing.T) {
 	}
 }
 
-// TestResolveScopesPeersThatAgree covers the other half: peers repeating one
-// definition identify it as well as a single scope would, so which one ran does
-// not matter.
-func TestResolveScopesPeersThatAgree(t *testing.T) {
+func TestResolveScopesChecksEveryApplicableSource(t *testing.T) {
+	loaded := false
 	scopes := []scope{
-		fixedScope("a", 0, serverSet{"linear": {Command: "npx", Args: []string{"-y", "linear-mcp"}}}),
-		fixedScope("b", 0, serverSet{"linear": {Command: "npx", Args: []string{"-y", "linear-mcp"}}}),
+		fixedScope("first", urlSet("linear", "https://first.example.com/sse")),
+		{path: "second", key: mcpServersKey, load: func(context.Context) (serverSet, loadResult) {
+			loaded = true
+			return urlSet("github", "https://second.example.com/sse"), loadOK
+		}},
 	}
 
-	m, out := resolveScopes(t.Context(), scopes, exactly("linear"), &tracer{})
-	if out != outcomeFound {
+	if _, out := resolveScopes(t.Context(), scopes, exactly("linear"), &tracer{}); out != outcomeFound {
 		t.Fatalf("outcome = %v, want outcomeFound", out)
 	}
-	if !slices.Equal(m.entry.Args, []string{"-y", "linear-mcp"}) {
-		t.Fatalf("entry = %+v", m.entry)
+	if !loaded {
+		t.Fatal("a later applicable scope was not loaded after the first one matched")
 	}
 }
 
-func TestResolveScopesPeersWithDifferentEnvironmentConflict(t *testing.T) {
+func TestResolveScopesMiss(t *testing.T) {
+	scopes := []scope{fixedScope("only", urlSet("github", "https://github.example.com/sse"))}
+
+	if _, out := resolveScopes(t.Context(), scopes, exactly("linear"), &tracer{}); out != outcomeMiss {
+		t.Fatalf("outcome = %v, want outcomeMiss", out)
+	}
+}
+
+func TestResolveScopesDifferentDeclarationsAreAmbiguous(t *testing.T) {
+	scopes := []scope{
+		fixedScope("a", urlSet("linear", "https://a.example.com/sse")),
+		fixedScope("b", urlSet("linear", "https://b.example.com/sse")),
+	}
+
+	if _, out := resolveScopes(t.Context(), scopes, exactly("linear"), &tracer{}); out != outcomeAmbiguous {
+		t.Fatalf("outcome = %v, want outcomeAmbiguous", out)
+	}
+}
+
+func TestResolveScopesIdenticalDeclarationsAreAmbiguous(t *testing.T) {
+	entry := mcpEntry{Command: "npx", Args: []string{"-y", "linear-mcp"}}
+	scopes := []scope{
+		fixedScope("a", serverSet{"linear": entry}),
+		fixedScope("b", serverSet{"linear": entry}),
+	}
+
+	if _, out := resolveScopes(t.Context(), scopes, exactly("linear"), &tracer{}); out != outcomeAmbiguous {
+		t.Fatalf("outcome = %v, want outcomeAmbiguous", out)
+	}
+}
+
+func TestResolveScopesDifferentEnvironmentIsAmbiguous(t *testing.T) {
 	base := mcpEntry{
 		Command: "npx",
 		Args:    []string{"-y", "linear-mcp"},
@@ -107,21 +91,19 @@ func TestResolveScopesPeersWithDifferentEnvironmentConflict(t *testing.T) {
 	shadow := base
 	shadow.Environment = map[string]string{"LINEAR_TOKEN": "user-token"}
 	scopes := []scope{
-		fixedScope("project", 0, serverSet{"linear": base}),
-		fixedScope("user", 0, serverSet{"linear": shadow}),
+		fixedScope("project", serverSet{"linear": base}),
+		fixedScope("user", serverSet{"linear": shadow}),
 	}
 
 	if _, out := resolveScopes(t.Context(), scopes, exactly("linear"), &tracer{}); out != outcomeAmbiguous {
-		t.Fatalf("outcome = %v, want outcomeAmbiguous for definitions that differ by environment", out)
+		t.Fatalf("outcome = %v, want outcomeAmbiguous", out)
 	}
 }
 
-// TestResolveScopesPeersRecordEveryMatch covers the diagnostic: for a conflict,
-// the two FOUND lines are the whole explanation of the denial.
-func TestResolveScopesPeersRecordEveryMatch(t *testing.T) {
+func TestResolveScopesRecordsEveryMatch(t *testing.T) {
 	scopes := []scope{
-		fixedScope("a", 0, urlSet("linear", "https://a.example.com/sse")),
-		fixedScope("b", 0, urlSet("linear", "https://b.example.com/sse")),
+		fixedScope("a", urlSet("linear", "https://a.example.com/sse")),
+		fixedScope("b", urlSet("linear", "https://b.example.com/sse")),
 	}
 
 	tr := &tracer{}
@@ -138,24 +120,41 @@ func TestResolveScopesPeersRecordEveryMatch(t *testing.T) {
 	}
 }
 
-// TestResolveScopesClosedScope covers an exclusive server set: a miss there ends
-// resolution instead of falling through.
 func TestResolveScopesClosedScope(t *testing.T) {
-	managed := fixedScope("managed", 0, urlSet("github", "https://managed.example.com/sse"))
+	managed := fixedScope("managed", urlSet("github", "https://managed.example.com/sse"))
 	managed.closed = true
-	scopes := []scope{managed, fixedScope("user", 1, urlSet("linear", "https://user.example.com/sse"))}
+	scopes := []scope{managed, fixedScope("user", urlSet("linear", "https://user.example.com/sse"))}
 
 	if _, out := resolveScopes(t.Context(), scopes, exactly("linear"), &tracer{}); out != outcomeClosed {
 		t.Fatalf("outcome = %v, want outcomeClosed", out)
 	}
 }
 
-// TestResolveScopesClosedScopeThatIsAbsent covers the same scope when its file is
-// not there: an absent exclusive set constrains nothing.
+func TestResolveScopesClosedMatchSuppressesLowerDeclaration(t *testing.T) {
+	loaded := false
+	managed := fixedScope("managed", urlSet("linear", "https://managed.example.com/sse"))
+	managed.closed = true
+	scopes := []scope{
+		managed,
+		{path: "user", key: mcpServersKey, load: func(context.Context) (serverSet, loadResult) {
+			loaded = true
+			return urlSet("linear", "https://user.example.com/sse"), loadOK
+		}},
+	}
+
+	m, out := resolveScopes(t.Context(), scopes, exactly("linear"), &tracer{})
+	if out != outcomeFound || m.entry.URL != "https://managed.example.com/sse" {
+		t.Fatalf("outcome = %v, match = %+v", out, m)
+	}
+	if loaded {
+		t.Fatal("a source suppressed by the closed scope was loaded")
+	}
+}
+
 func TestResolveScopesClosedScopeThatIsAbsent(t *testing.T) {
 	scopes := []scope{
 		{path: "managed", key: mcpServersKey, closed: true, load: fixedServers(nil, loadAbsent)},
-		fixedScope("user", 1, urlSet("linear", "https://user.example.com/sse")),
+		fixedScope("user", urlSet("linear", "https://user.example.com/sse")),
 	}
 
 	m, out := resolveScopes(t.Context(), scopes, exactly("linear"), &tracer{})
@@ -167,68 +166,63 @@ func TestResolveScopesClosedScopeThatIsAbsent(t *testing.T) {
 	}
 }
 
-func TestMatchNameExactBeatsFormAcrossTheLadder(t *testing.T) {
+func TestMatchNamesReturnsExactAndFormMatchesAcrossTheLadder(t *testing.T) {
 	set := serverSet{
 		"user-linear": {URL: "https://prefixed.example.com/sse"},
 		"user.linear": {URL: "https://folded.example.com/sse"},
 	}
 
-	names := lookup{names: []string{"user-linear", "user_linear"}, form: formCodex}
-	entry, key, ok := matchName(names, set)
-	if !ok {
-		t.Fatal("no match")
+	matches := matchNames(lookup{names: []string{"user-linear", "user_linear"}, form: formCodex}, set)
+	if len(matches) != 2 {
+		t.Fatalf("matches = %+v, want two", matches)
 	}
-	if key != "user-linear" || entry.URL != "https://prefixed.example.com/sse" {
-		t.Fatalf("matched %q (%s), want the exact hit on the first rung", key, entry.URL)
+	keys := []string{matches[0].key, matches[1].key}
+	if !slices.Equal(keys, []string{"user-linear", "user.linear"}) {
+		t.Fatalf("matched keys = %v", keys)
 	}
 }
 
-func TestMatchNameFormMatchesForward(t *testing.T) {
+func TestMatchNamesFormMatchesForward(t *testing.T) {
 	set := serverSet{"my-linear": {URL: "https://linear.example.com/sse"}}
 
-	if _, _, ok := matchName(exactly("my_linear"), set); ok {
+	if matches := matchNames(exactly("my_linear"), set); len(matches) != 0 {
 		t.Fatal("matched without a form; only an exact key may match then")
 	}
-	_, key, ok := matchName(lookup{names: []string{"my_linear"}, form: formCodex}, set)
-	if !ok {
-		t.Fatal("Codex's fold did not match its own configuration key")
-	}
-	if key != "my-linear" {
-		t.Fatalf("matched key %q, want the configuration key as the user wrote it", key)
+	matches := matchNames(lookup{names: []string{"my_linear"}, form: formCodex}, set)
+	if len(matches) != 1 || matches[0].key != "my-linear" {
+		t.Fatalf("matches = %+v, want the configuration key as written", matches)
 	}
 
-	// Not the reverse: the report is never folded. A key that is already the folded
-	// form does not match a report carrying the unfolded one, because no agent sends
-	// that.
+	// Not the reverse: the report is never folded.
 	folded := serverSet{"my_linear": {URL: "https://linear.example.com/sse"}}
-	if _, _, ok := matchName(lookup{names: []string{"my-linear"}, form: formCodex}, folded); ok {
+	if matches := matchNames(lookup{names: []string{"my-linear"}, form: formCodex}, folded); len(matches) != 0 {
 		t.Fatal("matched backwards; the reported name must not be transformed")
 	}
 }
 
-func TestMatchNameFormIsDeterministicOnCollision(t *testing.T) {
+func TestMatchNamesFormReturnsEveryCollisionDeterministically(t *testing.T) {
 	set := serverSet{
 		"my-server": {URL: "https://hyphen.example.com/sse"},
 		"my.server": {URL: "https://dot.example.com/sse"},
 	}
 	names := lookup{names: []string{"my_server"}, form: formCodex}
 
-	_, first, ok := matchName(names, set)
-	if !ok {
-		t.Fatal("no match")
+	matches := matchNames(names, set)
+	if len(matches) != 2 {
+		t.Fatalf("matches = %+v, want two", matches)
 	}
-	if first != "my-server" {
-		t.Fatalf("matched %q, want the first key in sorted order", first)
+	keys := []string{matches[0].key, matches[1].key}
+	if !slices.Equal(keys, []string{"my-server", "my.server"}) {
+		t.Fatalf("matched keys = %v, want sorted collisions", keys)
 	}
 	for range 20 {
-		if _, key, _ := matchName(names, set); key != first {
-			t.Fatalf("matched %q then %q; collision resolution is not deterministic", first, key)
+		again := matchNames(names, set)
+		if !slices.Equal([]string{again[0].key, again[1].key}, keys) {
+			t.Fatalf("matched keys changed from %v to %+v", keys, again)
 		}
 	}
 }
 
-// TestDecodeServersKeepsMalformedSiblings covers the tolerance rule: one entry
-// that does not decode must not cost every other server in the file.
 func TestDecodeServersKeepsMalformedSiblings(t *testing.T) {
 	f := newFixture(t, "darwin")
 	path := f.write(f.path("mcp.json"), `{"mcpServers":{
@@ -243,13 +237,11 @@ func TestDecodeServersKeepsMalformedSiblings(t *testing.T) {
 	if set["linear"].URL != "https://linear.example.com/sse" {
 		t.Fatalf("the healthy sibling did not decode: %+v", set)
 	}
-	// The broken key stays present: it names a configured server that identifies
-	// nothing, which is a match rather than an invitation to look further down.
 	entry, ok := set["broken"]
 	if !ok {
 		t.Fatal("the malformed entry went missing")
 	}
-	if !sameEntry(entry, mcpEntry{}) {
+	if entry.URL != "" || entry.Command != "" || len(entry.Args) != 0 || len(entry.Environment) != 0 {
 		t.Fatalf("malformed entry = %+v, want the zero entry", entry)
 	}
 }

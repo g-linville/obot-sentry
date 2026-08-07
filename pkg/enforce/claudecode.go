@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 )
 
@@ -173,10 +174,7 @@ func resolveClaudeCode(ctx context.Context, loader *configLoader, env Env, req R
 
 	scopes, gap := claudeCodeScopes(ctx, loader, env, req.CWD, serverName, claudePath, claude, claudeRes)
 	m, out := resolveScopes(ctx, scopes, names, tr)
-	switch out {
-	case outcomeAmbiguous:
-		return ambiguous(req.Agent, serverName)
-	case outcomeClosed:
+	if out == outcomeClosed {
 		// The managed lockdown stops plugin servers from running at all, so an
 		// incompletely enumerated plugin tree cannot change this answer and is not
 		// worth reporting over it.
@@ -187,13 +185,23 @@ func resolveClaudeCode(ctx context.Context, loader *configLoader, env Env, req R
 		// this hook cannot read in full — some of it is outside any file it could
 		// parse — so a name that matches a connector this installation has connected
 		// to is reported as undecidable rather than guessed in either direction.
-		if connector, ok := resolveClaudeAIConnector(claude, claudeRes, claudePath, serverName, tr); ok {
-			return unresolved(connector, fmt.Sprintf(
+		connectors := resolveClaudeAIConnectors(claude, claudeRes, claudePath, serverName, tr)
+		if len(connectors) > 1 {
+			return ambiguous(req.Agent, serverName)
+		}
+		if len(connectors) == 1 {
+			return unresolved(connectors[0], fmt.Sprintf(
 				"MCP server %q is not in Claude Code's managed MCP configuration, but it names a claude.ai connector this installation has connected to, and whether the managed configuration suppresses that connector depends on a managed setting the hook cannot read",
 				serverName))
 		}
 		return notFound(req.Agent, serverName, fmt.Sprintf(
 			"MCP server %q is not in Claude Code's managed MCP configuration, which cannot be overridden", serverName))
+	}
+	if out == outcomeAmbiguous {
+		// Include connector matches in the trace even though the configuration
+		// declarations already make the result ambiguous.
+		resolveClaudeAIConnectors(claude, claudeRes, claudePath, serverName, tr)
+		return ambiguous(req.Agent, serverName)
 	}
 
 	// A plugin source we could not enumerate denies whatever the ladder concluded,
@@ -203,16 +211,19 @@ func resolveClaudeCode(ctx context.Context, loader *configLoader, env Env, req R
 		return unresolvedPluginGap(serverName, gap, tr)
 	}
 
+	connectors := resolveClaudeAIConnectors(claude, claudeRes, claudePath, serverName, tr)
+	if len(connectors) > 1 || (out == outcomeFound && len(connectors) == 1) {
+		return ambiguous(req.Agent, serverName)
+	}
 	if out == outcomeFound {
 		return resolved(env, m.key, m.entry)
 	}
-
-	if connector, ok := resolveClaudeAIConnector(claude, claudeRes, claudePath, serverName, tr); ok {
+	if len(connectors) == 1 {
 		// The display name, not the tool-name hint that found it: the hint is the
 		// namespace form (claude_ai_Linear for a connector listed as "claude.ai
 		// Linear"), which appears in no allowlist entry an administrator could write.
-		res := Resolution{ServerName: connector}
-		res.Identity.Connector = connector
+		res := Resolution{ServerName: connectors[0]}
+		res.Identity.Connector = connectors[0]
 		return res
 	}
 
@@ -220,10 +231,10 @@ func resolveClaudeCode(ctx context.Context, loader *configLoader, env Env, req R
 		"MCP server %q was not found in any Claude Code MCP configuration", serverName))
 }
 
-// claudeCodeScopes returns the Claude Code MCP configuration scopes, highest
-// precedence first: the managed config, the working directory's own entry in the
-// user config, the project files at and above the working directory, the user-wide
-// servers table, and last the installed plugins.
+// claudeCodeScopes returns the Claude Code MCP configuration sources in diagnostic
+// order: the managed config, the working directory's entries in the user config,
+// the project files at and above the working directory, the user-wide servers table,
+// and last the installed plugins.
 //
 // It also reports a plugin source that exists and could not be enumerated, which
 // denies rather than falling through — see pluginGap.
@@ -246,10 +257,9 @@ func claudeCodeScopes(ctx context.Context, loader *configLoader, env Env, cwd, s
 		load:   jsonServers(loader, managedPath),
 	}}
 
-	// The working directory's own entry in the user config outranks the project
-	// files. It is the private per-project table, and the agent lets it overwrite
-	// anything a checked-in project file declares.
-	if key, ok := projectsKey(env, claude, cwd); ok {
+	// More than one raw key can name the same directory after path normalization,
+	// and the hook cannot safely choose one spelling on the agent's behalf.
+	for _, key := range projectsKeys(env, claude, cwd) {
 		scopes = append(scopes, scope{
 			path: claudePath,
 			key:  fmt.Sprintf("projects[%q].%s", key, mcpServersKey),
@@ -271,28 +281,22 @@ func claudeCodeScopes(ctx context.Context, loader *configLoader, env Env, cwd, s
 		load: fixedServers(decodeServers(claude.MCPServers), claudeRes),
 	})
 
-	// Every scope so far is a singleton, so position is precedence.
-	for i := range scopes {
-		scopes[i].rank = i
-	}
-
-	// Plugins rank last. The agent merges their servers first and lets user, project,
-	// and local configuration overwrite them by key, and nothing reserves the plugin
-	// namespace against a user writing one of its names by hand — so a name declared
-	// in both places is the user's, not the plugin's.
-	plugin, gap := claudePluginScopes(ctx, loader, env, cwd, serverName, len(scopes))
+	// Plugins are ordinary candidates too. A matching user, project, or local
+	// declaration collides with a plugin declaration instead of shadowing it.
+	plugin, gap := claudePluginScopes(ctx, loader, env, cwd, serverName)
 	return append(scopes, plugin...), gap
 }
 
 // maxProjectDepth bounds the ancestor walk.
 const maxProjectDepth = 40
 
-// projectsKey returns the key in the user config's per-project table that names the
-// working directory, if there is one.
+// projectsKeys returns every key in the user config's per-project table that names
+// the working directory, in stable order.
 //
-// That table is keyed by the directory the agent was launched in, and exactly one
-// key is ever read: the one naming that directory. An enclosing directory's entry
-// belongs to a different session and never governs this call, so it is not consulted.
+// That table is keyed by the directory the agent was launched in. An enclosing
+// directory's entry belongs to a different session and never governs this call, so
+// it is not consulted. Multiple raw keys that normalize to this directory are kept:
+// the payload does not carry the original launch-path spelling needed to choose one.
 //
 // The directory here comes from the hook payload, which carries the agent's current
 // working directory. That is the same directory in the ordinary case but not always:
@@ -300,26 +304,21 @@ const maxProjectDepth = 40
 // whose working directory has since moved will disagree. The payload carries no way
 // to recover the original, so the current directory is the best anchor available.
 // TODO(g-linville): see if there is something we can do about this.
-func projectsKey(env Env, claude claudeJSON, cwd string) (string, bool) {
+func projectsKeys(env Env, claude claudeJSON, cwd string) []string {
 	cwd = strings.TrimSpace(cwd)
 	if cwd == "" || !filepath.IsAbs(cwd) {
-		return "", false
+		return nil
 	}
 	want := env.comparableDir(cwd)
 
-	var found string
+	var found []string
 	for key := range claude.Projects {
-		if env.comparableDir(key) != want {
-			continue
-		}
-		// Two keys can name one directory through spelling alone. Taking the lowest
-		// keeps resolution stable across runs, since map order is not.
-		// TODO(g-linville): could this cause shadowing?
-		if found == "" || key < found {
-			found = key
+		if env.comparableDir(key) == want {
+			found = append(found, key)
 		}
 	}
-	return found, found != ""
+	slices.Sort(found)
+	return found
 }
 
 // projectFilePaths returns the project MCP files for cwd, caching them for the
@@ -337,9 +336,9 @@ func (l *configLoader) projectFilePaths(cwd string) []string {
 // cwd, nearest first.
 //
 // Every directory from the working directory upwards can hold one and the agent
-// reads them all, letting a nearer file overwrite a farther one. Consecutive ranks
-// in this order say exactly that. The volume root is left out, which is where the
-// agent's own walk stops.
+// reads them all. They remain in nearest-first order for diagnostics, but every
+// matching declaration is a candidate. The volume root is left out, which is where
+// the agent's own walk stops.
 //
 // With no file anywhere, the working directory's own path is returned regardless, so
 // that the file an operator expects to be read is named in the trace as absent
@@ -415,13 +414,13 @@ func (e Env) comparableDir(path string) string {
 	return filepath.Clean(path)
 }
 
-func resolveClaudeAIConnector(claude claudeJSON, claudeRes loadResult, claudePath, serverName string, tr *tracer) (string, bool) {
+func resolveClaudeAIConnectors(claude claudeJSON, claudeRes loadResult, claudePath, serverName string, tr *tracer) []string {
 	if !strings.HasPrefix(serverName, claudeAIConnectorPrefix) {
-		return "", false
+		return nil
 	}
 	if claudeRes != loadOK || len(claude.ClaudeAIMCPEverConnected) == 0 {
 		tr.miss(claudePath, "claudeAiMcpEverConnected", claudeRes)
-		return "", false
+		return nil
 	}
 
 	connected := make(map[string]struct{}, len(claude.ClaudeAIMCPEverConnected))
@@ -440,10 +439,15 @@ func resolveClaudeAIConnector(claude claudeJSON, claudeRes loadResult, claudePat
 	// "_<n>" off the reported name and looking for "claude.ai MyServer" instead, which
 	// is the obvious-looking thing to do, finds the FIRST connector: the wrong one.
 	names := lookup{names: []string{serverName}, form: formClaudeCode}
-	if _, connector, ok := matchName(names, connected); ok {
-		tr.hit(claudePath, "claudeAiMcpEverConnected", "connector "+connector)
-		return connector, true
+	matches := matchNames(names, connected)
+	if len(matches) > 0 {
+		connectors := make([]string, 0, len(matches))
+		for _, m := range matches {
+			tr.hit(claudePath, "claudeAiMcpEverConnected", "connector "+m.key)
+			connectors = append(connectors, m.key)
+		}
+		return connectors
 	}
 	tr.miss(claudePath, "claudeAiMcpEverConnected", claudeRes)
-	return "", false
+	return nil
 }

@@ -86,14 +86,14 @@ func TestCursorLookupNameLadder(t *testing.T) {
 	}
 }
 
-func TestCursorPrefersTheUnprefixedNameOverAPrefixLookalike(t *testing.T) {
+func TestCursorPrefixLookalikeIsUnresolved(t *testing.T) {
 	f := newFixture(t, "darwin")
 	f.write(f.homePath(".cursor", "mcp.json"), `{"mcpServers":{
 		"user-linear": {"url": "https://literal.example.com/sse"},
 		"linear":      {"url": "https://stripped.example.com/sse"}
 	}}`)
 
-	assertURL(t, Resolve(f.Env, cursorReq("user-linear")), "https://literal.example.com/sse")
+	assertUnresolved(t, Resolve(f.Env, cursorReq("user-linear")), "more than one Cursor MCP server could match")
 }
 
 func TestCursorUndecodableEntryStillCountsAsADeclaration(t *testing.T) {
@@ -107,14 +107,13 @@ func TestCursorUndecodableEntryStillCountsAsADeclaration(t *testing.T) {
 		`{"mcpServers":{"my-server":{"url":"https://user-scope.example.com/sse"}}}`)
 
 	res := Resolve(f.Env, cursorReq("my-server", workspace))
-	assertUnresolved(t, res, "conflicting definitions in more than one Cursor configuration scope")
+	assertUnresolved(t, res, "more than one Cursor MCP server could match")
 	if res.Identity.URL != "" {
 		t.Errorf("Identity.URL = %q, want nothing: the user-scope entry must not answer for a name the project scope also declares", res.Identity.URL)
 	}
 }
 
-// TestCursorWorkspaceBeatsUser covers precedence.
-func TestCursorWorkspaceBeatsUser(t *testing.T) {
+func TestCursorSingleWorkspaceMatchResolves(t *testing.T) {
 	f := newFixture(t, "darwin")
 	ws := f.mkdir(f.path("ws"))
 	f.write(filepath.Join(ws, ".cursor", "mcp.json"), `{"mcpServers":{"linear":{"url":"https://workspace.example.com/sse"}}}`)
@@ -141,7 +140,7 @@ func TestCursorCollidingNameIsUnresolved(t *testing.T) {
 		`{"mcpServers":{"probe-uvx-stdio":{"command":"npx","args":["-y","some-other-package"]}}}`)
 
 	res := Resolve(f.Env, cursorReq("probe-uvx-stdio", ws))
-	assertUnresolved(t, res, "conflicting definitions in more than one Cursor configuration scope")
+	assertUnresolved(t, res, "more than one Cursor MCP server could match")
 	if res.ServerName != "probe-uvx-stdio" {
 		t.Errorf("ServerName = %q, want the display name", res.ServerName)
 	}
@@ -173,7 +172,18 @@ func TestCursorCollidingNameWithDifferentEnvironmentIsUnresolved(t *testing.T) {
 	}}`)
 
 	res := Resolve(f.Env, cursorReq("linear", ws))
-	assertUnresolved(t, res, "conflicting definitions in more than one Cursor configuration scope")
+	assertUnresolved(t, res, "more than one Cursor MCP server could match")
+}
+
+func TestCursorIdenticalDeclarationsAreUnresolved(t *testing.T) {
+	f := newFixture(t, "darwin")
+	ws := f.mkdir(f.path("ws"))
+	entry := `{"mcpServers":{"linear":{"command":"npx","args":["linear-mcp"]}}}`
+	f.write(filepath.Join(ws, ".cursor", "mcp.json"), entry)
+	f.write(f.homePath(".cursor", "mcp.json"), entry)
+
+	assertUnresolved(t, Resolve(f.Env, cursorReq("linear", ws)),
+		"more than one Cursor MCP server could match")
 }
 
 // TestCursorSingleScopeResolves is the other half of the collision rule: a

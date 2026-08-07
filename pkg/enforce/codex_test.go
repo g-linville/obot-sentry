@@ -52,13 +52,12 @@ func TestCodexWindowsManagedConfig(t *testing.T) {
 	}
 }
 
-// TestCodexUserConfigFirst covers the precedence between the three files.
-func TestCodexUserConfigFirst(t *testing.T) {
+func TestCodexDuplicateAcrossConfigFilesIsUnresolved(t *testing.T) {
 	f := newFixture(t, "darwin")
 	f.write(f.homePath(".codex", "config.toml"), "[mcp_servers.linear]\nurl = \"https://user.example.com/sse\"\n")
 	f.write(f.machinePath("/etc/codex/managed_config.toml"), "[mcp_servers.linear]\nurl = \"https://managed.example.com/sse\"\n")
 
-	assertURL(t, Resolve(f.Env, codexReq("linear")), "https://user.example.com/sse")
+	assertUnresolved(t, Resolve(f.Env, codexReq("linear")), "more than one Codex MCP server could match")
 }
 
 func TestCodexNamespaceFormFallback(t *testing.T) {
@@ -68,8 +67,37 @@ func TestCodexNamespaceFormFallback(t *testing.T) {
 
 	res := Resolve(f.Env, codexReq("My_Linear"))
 	assertURL(t, res, "https://linear.example.com/sse")
-	if last, want := res.Trace[len(res.Trace)-1], `matched as "My-Linear"`; last.Note != want {
-		t.Fatalf("trace note = %q, want %q: the matched key is what an allowlist entry has to spell", last.Note, want)
+	var matched TraceStep
+	for _, step := range res.Trace {
+		if step.Matched {
+			matched = step
+			break
+		}
+	}
+	if want := `matched as "My-Linear"`; matched.Note != want {
+		t.Fatalf("trace note = %q, want %q: the matched key is what an allowlist entry has to spell", matched.Note, want)
+	}
+}
+
+func TestCodexNamespaceCollisionWithinOneFileIsUnresolved(t *testing.T) {
+	f := newFixture(t, "darwin")
+	f.write(f.homePath(".codex", "config.toml"), `
+[mcp_servers."my-server"]
+url = "https://hyphen.example.com/sse"
+[mcp_servers."my.server"]
+url = "https://dot.example.com/sse"
+`)
+
+	res := Resolve(f.Env, codexReq("my_server"))
+	assertUnresolved(t, res, "more than one Codex MCP server could match")
+	var got []string
+	for _, step := range res.Trace {
+		if step.Matched {
+			got = append(got, step.Key)
+		}
+	}
+	if !slices.Equal(got, []string{`mcp_servers["my-server"]`, `mcp_servers["my.server"]`}) {
+		t.Fatalf("matched trace keys = %v", got)
 	}
 }
 

@@ -29,10 +29,8 @@ type scope struct {
 	// path and key name the source, for the trace.
 	path string
 	key  string
-	// rank orders precedence: lower wins, and scopes sharing a rank are peers.
-	rank int
 	// closed marks a scope whose server set the agent treats as exclusive, so a
-	// miss here ends resolution instead of falling through to lower ranks.
+	// readable source ends resolution instead of consulting lower scopes.
 	closed bool
 	load   func(context.Context) (serverSet, loadResult)
 }
@@ -50,27 +48,44 @@ type lookup struct {
 	form  namespaceForm
 }
 
-// matchName runs a name ladder against the keys of m. Every name is tried exactly
-// before any is retried through the form, so a later rung can never beat an exact
-// hit on an earlier one.
-func matchName[T any](l lookup, m map[string]T) (value T, key string, found bool) {
+// namedMatch is one distinct key reached through a lookup.
+type namedMatch[T any] struct {
+	value T
+	key   string
+}
+
+// matchNames runs a name ladder against the keys of m and returns every distinct
+// key it can reach. Exact forms come first, followed by namespace forms in sorted
+// key order, so traces remain deterministic. A key reached more than once is
+// returned once: it is one declaration even if more than one lookup form names it.
+func matchNames[T any](l lookup, m map[string]T) []namedMatch[T] {
+	var matches []namedMatch[T]
+	seen := make(map[string]struct{})
 	for _, name := range l.names {
+		if _, ok := seen[name]; ok {
+			continue
+		}
 		if v, ok := m[name]; ok {
-			return v, name, true
+			matches = append(matches, namedMatch[T]{value: v, key: name})
+			seen[name] = struct{}{}
 		}
 	}
 	if l.form == nil {
-		return value, "", false
+		return matches
 	}
 	keys := slices.Sorted(maps.Keys(m))
 	for _, name := range l.names {
 		for _, k := range keys {
+			if _, ok := seen[k]; ok {
+				continue
+			}
 			if l.form(k) == name {
-				return m[k], k, true
+				matches = append(matches, namedMatch[T]{value: m[k], key: k})
+				seen[k] = struct{}{}
 			}
 		}
 	}
-	return value, "", false
+	return matches
 }
 
 // note describes a match whose key is not the name the call reported.
@@ -91,7 +106,7 @@ const (
 	outcomeFound
 	// outcomeClosed means a closed scope ended resolution without a match.
 	outcomeClosed
-	// outcomeAmbiguous means peer scopes defined the name differently.
+	// outcomeAmbiguous means more than one server declaration matched.
 	outcomeAmbiguous
 )
 
@@ -101,71 +116,54 @@ type match struct {
 	entry mcpEntry
 }
 
-// resolveScopes walks scopes, which must be ordered by rank, and returns the
-// declaration that governs the call.
+// resolveScopes walks every applicable scope and returns a declaration only when
+// exactly one matches. Source order is diagnostic, not precedence: a second match
+// is ambiguous even when it repeats the first definition byte-for-byte.
 //
-// Rank is the whole of precedence, so scopes sharing a rank are peers: nothing
-// orders them, and a name they define differently is ambiguous rather than settled
-// by search order.
+// A readable closed scope is the one exception. Its server set is exclusive, so
+// lower sources cannot have governed the call and are not consulted.
 func resolveScopes(ctx context.Context, scopes []scope, names lookup, tr *tracer) (match, outcome) {
-	for i := 0; i < len(scopes); {
-		var (
-			peers  []match
-			closed bool
-		)
-		j := i
-		for ; j < len(scopes) && scopes[j].rank == scopes[i].rank; j++ {
-			s := scopes[j]
-			set, res := s.load(ctx)
-			if res != loadOK {
-				tr.miss(s.path, s.traceKey(""), res)
-				continue
-			}
-			entry, key, ok := matchName(names, set)
-			if !ok {
-				tr.miss(s.path, s.traceKey(""), res)
-				closed = closed || s.closed
-				continue
-			}
-			tr.hit(s.path, s.traceKey(key), names.note(key))
-			peers = append(peers, match{key: key, entry: entry})
+	var found []match
+	for _, s := range scopes {
+		set, res := s.load(ctx)
+		if res != loadOK {
+			tr.miss(s.path, s.traceKey(""), res)
+			continue
 		}
-		i = j
-
-		switch {
-		case len(peers) == 1:
-			return peers[0], outcomeFound
-		case len(peers) > 1:
-			if agreed, ok := agree(peers); ok {
-				return agreed, outcomeFound
+		matches := matchNames(names, set)
+		if len(matches) == 0 {
+			tr.miss(s.path, s.traceKey(""), res)
+		} else {
+			for _, m := range matches {
+				tr.hit(s.path, s.traceKey(m.key), names.note(m.key))
+				found = append(found, match{key: m.key, entry: m.value})
 			}
-			return match{}, outcomeAmbiguous
-		case closed:
-			return match{}, outcomeClosed
+		}
+		if s.closed {
+			switch len(found) {
+			case 0:
+				return match{}, outcomeClosed
+			case 1:
+				return found[0], outcomeFound
+			default:
+				return match{}, outcomeAmbiguous
+			}
 		}
 	}
-	return match{}, outcomeMiss
-}
-
-// agree collapses peers that repeat one definition, which identifies the server
-// just as well as a single scope would. Only a genuine conflict is unresolvable.
-func agree(peers []match) (match, bool) {
-	for _, peer := range peers[1:] {
-		if !sameEntry(peers[0].entry, peer.entry) {
-			return match{}, false
-		}
+	switch len(found) {
+	case 0:
+		return match{}, outcomeMiss
+	case 1:
+		return found[0], outcomeFound
+	default:
+		return match{}, outcomeAmbiguous
 	}
-	return peers[0], true
-}
-
-func sameEntry(a, b mcpEntry) bool {
-	return a.URL == b.URL && a.Command == b.Command && slices.Equal(a.Args, b.Args) && maps.Equal(a.Environment, b.Environment)
 }
 
 func ambiguous(agent localagent.Agent, name string) Resolution {
 	return unresolved(name, fmt.Sprintf(
-		"MCP server %q is declared with conflicting definitions in more than one %s configuration scope and the hook cannot tell which one ran; rename one of them",
-		name, agent.DisplayName()))
+		"more than one %s MCP server could match %q, so the hook cannot tell which one ran; rename or remove one of them",
+		agent.DisplayName(), name))
 }
 
 // ambiguousToolName reports a tool name that divides into a server and a tool in
@@ -238,8 +236,8 @@ func fixedServers(set serverSet, res loadResult) func(context.Context) (serverSe
 // decodeServers decodes each entry on its own so one malformed sibling cannot cost
 // the whole table, and with it every other server configured in it. A key that
 // fails to decode stays present with a zero entry: it names a configured server
-// that identifies nothing, which is a match rather than an invitation for a
-// lower-ranked scope to answer for it.
+// that identifies nothing, which is a match rather than an invitation for another
+// source to answer for it.
 func decodeServers(raw map[string]json.RawMessage) serverSet {
 	set := make(serverSet, len(raw))
 	for name, msg := range raw {

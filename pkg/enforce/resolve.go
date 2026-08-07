@@ -30,9 +30,9 @@ type TraceStep struct {
 	// Exists reports whether the file was present.
 	Exists bool
 	// Matched reports whether the server was found here. Normally at most one
-	// step in a trace matches, and it is the last step — but a Cursor name
-	// declared in more than one scope records a match per scope, because two
-	// FOUND lines are the whole diagnostic for that denial (see resolveCursor).
+	// step in a trace matches. When more than one server can match, every matching
+	// declaration is recorded because the FOUND lines are the diagnostic for the
+	// unresolved result.
 	Matched bool
 	// Note carries the detail behind a step: why a present file yielded nothing,
 	// or which lookup form matched.
@@ -256,8 +256,7 @@ func isBuiltinAgentMCP(agent localagent.Agent, serverName string) bool {
 	if !ok {
 		return false
 	}
-	_, _, ok = matchName(lookup{names: []string{serverName}, form: agentNamespaceForm(agent)}, servers)
-	return ok
+	return len(matchNames(lookup{names: []string{serverName}, form: agentNamespaceForm(agent)}, servers)) == 1
 }
 
 // agentNamespaceForm is the transform an agent applies when building a tool

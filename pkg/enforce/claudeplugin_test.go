@@ -70,9 +70,7 @@ func TestClaudeCodePluginMCPJSONWrapperForm(t *testing.T) {
 		"https://discord.example.com/mcp")
 }
 
-// TestClaudeCodePluginManifestBeatsMCPJSON covers the merge order inside one plugin:
-// the agent spreads the manifest's table over the file's, so the manifest wins.
-func TestClaudeCodePluginManifestBeatsMCPJSON(t *testing.T) {
+func TestClaudeCodePluginManifestAndMCPJSONCollisionIsUnresolved(t *testing.T) {
 	f := newFixture(t, "darwin")
 	root := f.installPlugin("acme@market")
 	f.write(filepath.Join(root, ".mcp.json"),
@@ -81,9 +79,13 @@ func TestClaudeCodePluginManifestBeatsMCPJSON(t *testing.T) {
 		`{"name":"acme","mcpServers":{"tools":{"url":"https://manifest.example.com/mcp"}}}`)
 
 	res := Resolve(f.Env, claudeCodeReq("plugin_acme_tools", f.path("proj")))
-	assertURL(t, res, "https://manifest.example.com/mcp")
-	if last := res.Trace[len(res.Trace)-1]; last.Path != manifest {
-		t.Fatalf("expected the match on the manifest:\n%s", resolveTrace(res))
+	assertUnresolved(t, res, "more than one Claude Code MCP server could match")
+	var matchedManifest bool
+	for _, step := range res.Trace {
+		matchedManifest = matchedManifest || step.Matched && step.Path == manifest
+	}
+	if !matchedManifest {
+		t.Fatalf("expected a match on the manifest:\n%s", resolveTrace(res))
 	}
 }
 
@@ -99,7 +101,11 @@ func TestClaudeCodePluginManifestStringPath(t *testing.T) {
 
 	res := Resolve(f.Env, claudeCodeReq("plugin_acme_tools", f.path("proj")))
 	assertURL(t, res, "https://pointed.example.com/mcp")
-	if last := res.Trace[len(res.Trace)-1]; last.Path != servers {
+	var matchedServer bool
+	for _, step := range res.Trace {
+		matchedServer = matchedServer || step.Matched && step.Path == servers
+	}
+	if !matchedServer {
 		t.Fatalf("expected the match on %s:\n%s", servers, resolveTrace(res))
 	}
 }
@@ -226,26 +232,23 @@ func TestClaudeCodePluginCollisionIsAmbiguous(t *testing.T) {
 	f.write(filepath.Join(fooBarRoot, ".mcp.json"), `{"baz":{"url":"https://foobar.example.com/mcp"}}`)
 
 	assertUnresolved(t, Resolve(f.Env, claudeCodeReq("plugin_foo_bar_baz", f.path("proj"))),
-		"conflicting definitions")
+		"more than one Claude Code MCP server could match")
 
-	// Peers that repeat one definition identify the server just as well as one scope
-	// would, so they resolve rather than denying.
+	// Repeating the same definition still leaves two separately declared servers.
 	f.write(filepath.Join(fooBarRoot, ".mcp.json"), `{"baz":{"url":"https://foo.example.com/mcp"}}`)
-	assertURL(t, Resolve(f.Env, claudeCodeReq("plugin_foo_bar_baz", f.path("proj"))),
-		"https://foo.example.com/mcp")
+	assertUnresolved(t, Resolve(f.Env, claudeCodeReq("plugin_foo_bar_baz", f.path("proj"))),
+		"more than one Claude Code MCP server could match")
 }
 
-// TestClaudeCodePluginUserConfigWins covers the precedence rule. Nothing reserves the
-// plugin namespace, and the agent lets user configuration overwrite a plugin key.
-func TestClaudeCodePluginUserConfigWins(t *testing.T) {
+func TestClaudeCodePluginAndUserConfigCollisionIsUnresolved(t *testing.T) {
 	f := newFixture(t, "darwin")
 	root := f.installPlugin("acme@market")
 	f.write(filepath.Join(root, ".mcp.json"), `{"tools":{"url":"https://plugin.example.com/mcp"}}`)
 	f.write(f.homePath(".claude.json"),
 		`{"mcpServers":{"plugin:acme:tools":{"url":"https://user.example.com/mcp"}}}`)
 
-	assertURL(t, Resolve(f.Env, claudeCodeReq("plugin_acme_tools", f.path("proj"))),
-		"https://user.example.com/mcp")
+	assertUnresolved(t, Resolve(f.Env, claudeCodeReq("plugin_acme_tools", f.path("proj"))),
+		"more than one Claude Code MCP server could match")
 }
 
 // TestClaudeCodePluginManagedConfigIsExclusive covers the managed lockdown reaching
@@ -353,16 +356,16 @@ func TestClaudeCodePluginSkillsDirNeedsAManifest(t *testing.T) {
 			"https://skill.example.com/mcp")
 	})
 
-	// A skills-root plugin's manifest is read like any other plugin's, so servers it
-	// declares itself are live and outrank the directory's own file.
+	// A skills-root plugin's manifest is read like any other plugin's, so a server it
+	// declares also collides with the directory's own declaration.
 	t.Run("manifest declares servers", func(t *testing.T) {
 		f := newFixture(t, "darwin")
 		dir := f.mkdir(f.homePath(".claude", "skills", "notes"))
 		f.write(filepath.Join(dir, claudePluginMCPFile), servers)
 		f.write(filepath.Join(dir, manifestRel),
 			`{"name":"notes","mcpServers":{"notes":{"url":"https://manifest.example.com/mcp"}}}`)
-		assertURL(t, Resolve(f.Env, claudeCodeReq("plugin_notes_notes", f.path("proj"))),
-			"https://manifest.example.com/mcp")
+		assertUnresolved(t, Resolve(f.Env, claudeCodeReq("plugin_notes_notes", f.path("proj"))),
+			"more than one Claude Code MCP server could match")
 	})
 }
 
@@ -513,8 +516,8 @@ func TestClaudeCodePluginMalformedFilesAreSkipped(t *testing.T) {
 		f.write(f.homePath(".claude.json"),
 			`{"mcpServers":{"plugin:acme:tools":{"url":"https://user.example.com/mcp"}}}`)
 
-		// The user table outranks the plugin anyway, so this only proves the malformed
-		// file did not take the resolution down with it.
+		// The malformed plugin file contributes no declaration, so the user table is
+		// the only match.
 		assertURL(t, Resolve(f.Env, claudeCodeReq("plugin_acme_tools", f.path("proj"))),
 			"https://user.example.com/mcp")
 	})

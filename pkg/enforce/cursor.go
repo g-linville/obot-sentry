@@ -35,8 +35,8 @@ func resolveCursor(ctx context.Context, loader *configLoader, env Env, req Resol
 	}
 }
 
-// cursorScopes returns every Cursor mcp.json as a peer of the others, in order:
-// each open workspace root, then the user-level file.
+// cursorScopes returns every Cursor mcp.json, in diagnostic order: each open
+// workspace root, then the user-level file.
 //
 // Nothing in the payload says which scope ran, so no scope may outrank another.
 // Two servers that share a name across scopes send byte-identical payloads, and

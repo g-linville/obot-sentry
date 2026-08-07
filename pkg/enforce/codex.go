@@ -45,16 +45,15 @@ func resolveCodex(ctx context.Context, loader *configLoader, env Env, serverName
 	}
 }
 
-// codexScopes returns the Codex config files as ranked scopes. Codex takes no
-// project-scoped MCP configuration, so cwd plays no part.
+// codexScopes returns every Codex config file that can declare the server. Codex
+// takes no project-scoped MCP configuration, so cwd plays no part.
 func codexScopes(loader *configLoader, env Env) []scope {
 	paths := env.codexConfigPaths()
 	scopes := make([]scope, 0, len(paths))
-	for i, path := range paths {
+	for _, path := range paths {
 		scopes = append(scopes, scope{
 			path: path,
 			key:  codexServersKey,
-			rank: i,
 			load: codexServers(loader, path),
 		})
 	}

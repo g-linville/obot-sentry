@@ -328,15 +328,10 @@ func (in pluginInstall) namespaced(set serverSet) serverSet {
 }
 
 // claudePluginScopes returns the scopes contributed by this machine's Claude Code
-// plugins, occupying rank for every plugin's manifest-declared sources and rank+1 for
-// every plugin's own .mcp.json.
-//
-// Claude Code reads <root>/.mcp.json and then spreads the manifest's mcpServers over
-// it, so the manifest wins within one plugin — hence the two ranks. Across plugins the
-// scopes at a rank are peers, which is the point: two plugins whose keys fold to one
-// namespace are a collision Claude Code resolves by silent last-wins, and peers make
-// it an explicit ambiguity instead of a guess about which server ran.
-func claudePluginScopes(ctx context.Context, loader *configLoader, env Env, cwd, serverName string, rank int) ([]scope, *pluginGap) {
+// plugins. Manifest-declared sources come first for stable diagnostics, followed by
+// every plugin's own .mcp.json. Source order does not settle collisions: every
+// matching declaration is a candidate.
+func claudePluginScopes(ctx context.Context, loader *configLoader, env Env, cwd, serverName string) ([]scope, *pluginGap) {
 	if !strings.HasPrefix(serverName, claudePluginNamespacePrefix) {
 		return nil, nil
 	}
@@ -346,14 +341,13 @@ func claudePluginScopes(ctx context.Context, loader *configLoader, env Env, cwd,
 		if !strings.HasPrefix(serverName, in.namespacePrefix()) {
 			continue
 		}
-		manifestScopes, manifestGap := pluginManifestScopes(ctx, loader, in, rank)
+		manifestScopes, manifestGap := pluginManifestScopes(ctx, loader, in)
 		gap = firstGap(gap, manifestGap)
 		manifests = append(manifests, manifestScopes...)
 		path := filepath.Join(in.root, claudePluginMCPFile)
 		files = append(files, scope{
 			path: path,
 			key:  mcpServersKey,
-			rank: rank + 1,
 			load: pluginServers(loader, in, path),
 		})
 	}
@@ -367,7 +361,7 @@ func claudePluginScopes(ctx context.Context, loader *configLoader, env Env, cwd,
 // file that was never going to say anything is noise. A declaration we cannot follow
 // does contribute one, loading as unusable, because a source silently dropped is the
 // one thing a resolution trace must never do.
-func pluginManifestScopes(ctx context.Context, loader *configLoader, in pluginInstall, rank int) ([]scope, *pluginGap) {
+func pluginManifestScopes(ctx context.Context, loader *configLoader, in pluginInstall) ([]scope, *pluginGap) {
 	manifestPath := filepath.Join(in.root, filepath.FromSlash(claudePluginManifestSub))
 	var doc struct {
 		MCPServers json.RawMessage `json:"mcpServers"`
@@ -379,7 +373,6 @@ func pluginManifestScopes(ctx context.Context, loader *configLoader, in pluginIn
 	unusable := scope{
 		path: manifestPath,
 		key:  mcpServersKey,
-		rank: rank,
 		load: func(context.Context) (serverSet, loadResult) { return nil, loadUnusable },
 	}
 
@@ -403,7 +396,6 @@ func pluginManifestScopes(ctx context.Context, loader *configLoader, in pluginIn
 			out = append(out, scope{
 				path: manifestPath,
 				key:  mcpServersKey,
-				rank: rank,
 				load: fixedServers(in.namespaced(decodeServers(servers)), loadOK),
 			})
 		case '"':
@@ -420,7 +412,6 @@ func pluginManifestScopes(ctx context.Context, loader *configLoader, in pluginIn
 			out = append(out, scope{
 				path: path,
 				key:  mcpServersKey,
-				rank: rank,
 				load: pluginServers(loader, in, path),
 			})
 		default:

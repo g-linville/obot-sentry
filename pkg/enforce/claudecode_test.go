@@ -37,8 +37,8 @@ func TestClaudeCodeFileOrder(t *testing.T) {
 	}
 
 	// Once it exists, the per-root project section is consulted between the managed
-	// config and the project .mcp.json: it is the private per-project table, and it
-	// outranks anything a checked-in project file declares.
+	// config and the project .mcp.json. The order is diagnostic; matching declarations
+	// in both sources are ambiguous.
 	f.write(f.homePath(".claude.json"), `{"projects":{`+quote(project)+`:{"mcpServers":{}}}}`)
 	res = Resolve(f.Env, claudeCodeReq("myserver", project))
 	want = []string{
@@ -55,10 +55,10 @@ func TestClaudeCodeFileOrder(t *testing.T) {
 	}
 }
 
-// TestClaudeCodeLocalScopeToolCallEndToEnd runs a real hook payload through the path
-// production uses, so the precedence between the private per-project table and a
-// checked-in project file is verified.
-func TestClaudeCodeLocalScopeToolCallEndToEnd(t *testing.T) {
+// TestClaudeCodeLocalAndProjectScopeToolCallIsUnresolved runs a real hook payload
+// through the production path and verifies that shadowing is not used to choose
+// between the private per-project table and a checked-in project file.
+func TestClaudeCodeLocalAndProjectScopeToolCallIsUnresolved(t *testing.T) {
 	f := newFixture(t, "darwin")
 	project := f.mkdir(f.path("proj"))
 	f.write(filepath.Join(project, ".mcp.json"),
@@ -73,14 +73,11 @@ func TestClaudeCodeLocalScopeToolCallEndToEnd(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if call.Request.Unresolved {
-		t.Fatalf("unresolved: %s", call.Request.UnresolvedReason)
+	if !call.Request.Unresolved || !strings.Contains(call.Request.UnresolvedReason, "more than one Claude Code MCP server could match") {
+		t.Fatalf("unresolved = %v, reason = %q", call.Request.Unresolved, call.Request.UnresolvedReason)
 	}
-	if call.Request.Tool != "echo" || call.Request.ServerName != "demo" {
-		t.Fatalf("tool = %q, server = %q, want echo/demo", call.Request.Tool, call.Request.ServerName)
-	}
-	if call.Request.Server.URL != "https://local.example.com/mcp" {
-		t.Fatalf("URL = %q, want the private per-project table to win", call.Request.Server.URL)
+	if call.Request.Server.URL != "" {
+		t.Fatalf("URL = %q, want no selected identity", call.Request.Server.URL)
 	}
 }
 
@@ -124,14 +121,13 @@ func TestClaudeCodeManagedConfigWindows(t *testing.T) {
 	assertURL(t, Resolve(f.Env, claudeCodeReq("myserver", f.path("proj"))), "https://managed.example.com/sse")
 }
 
-// TestClaudeCodeProjectBeatsGlobal covers the ordinary precedence case.
-func TestClaudeCodeProjectBeatsGlobal(t *testing.T) {
+func TestClaudeCodeProjectAndGlobalCollisionIsUnresolved(t *testing.T) {
 	f := newFixture(t, "darwin")
 	project := f.path("proj")
 	f.write(filepath.Join(project, ".mcp.json"), `{"mcpServers":{"myserver":{"url":"https://project.example.com/sse"}}}`)
 	f.write(f.homePath(".claude.json"), `{"mcpServers":{"myserver":{"url":"https://global.example.com/sse"}}}`)
 
-	assertURL(t, Resolve(f.Env, claudeCodeReq("myserver", project)), "https://project.example.com/sse")
+	assertUnresolved(t, Resolve(f.Env, claudeCodeReq("myserver", project)), "more than one Claude Code MCP server could match")
 }
 
 // TestClaudeCodeProjectsKeySpelling covers the two spellings of one directory.
@@ -154,10 +150,28 @@ func TestClaudeCodeProjectsKeySpelling(t *testing.T) {
 	})
 }
 
-// TestClaudeCodeDepthOrder is the load-bearing ordering test: the working
-// directory's own entry in the user config outranks every project file, and a
-// nearer project file outranks a farther one.
-func TestClaudeCodeDepthOrder(t *testing.T) {
+func TestClaudeCodeEquivalentProjectsKeysAreUnresolved(t *testing.T) {
+	f := newFixture(t, "darwin")
+	project := f.mkdir(f.path("proj"))
+	f.write(f.homePath(".claude.json"), `{"projects":{
+		`+quote(project)+`:{"mcpServers":{"myserver":{"url":"https://clean.example.com/sse"}}},
+		`+quote(project+string(filepath.Separator))+`:{"mcpServers":{"myserver":{"url":"https://slash.example.com/sse"}}}
+	}}`)
+
+	res := Resolve(f.Env, claudeCodeReq("myserver", project))
+	assertUnresolved(t, res, "more than one Claude Code MCP server could match")
+	var matches int
+	for _, step := range res.Trace {
+		if step.Matched {
+			matches++
+		}
+	}
+	if matches != 2 {
+		t.Fatalf("matched trace entries = %d, want 2\n%s", matches, resolveTrace(res))
+	}
+}
+
+func TestClaudeCodeDepthCollisionsAreUnresolved(t *testing.T) {
 	f := newFixture(t, "darwin")
 	project := f.mkdir(f.path("proj"))
 	cwd := f.mkdir(filepath.Join(project, "a", "b"))
@@ -168,23 +182,21 @@ func TestClaudeCodeDepthOrder(t *testing.T) {
 		`+quote(cwd)+`:{"mcpServers":{"myserver":{"url":"https://cwd-projects.example.com/sse"}}}
 	}}`)
 
-	// The working directory's own projects{} entry is the most specific source there
-	// is: it is private to this project and overwrites the checked-in files.
-	assertURL(t, Resolve(f.Env, claudeCodeReq("myserver", cwd)), "https://cwd-projects.example.com/sse")
+	assertUnresolved(t, Resolve(f.Env, claudeCodeReq("myserver", cwd)), "more than one Claude Code MCP server could match")
 
-	// With it silent, the nearest project file answers.
+	// With the private entry silent, the two project files still collide.
 	f.write(f.homePath(".claude.json"), `{"projects":{`+quote(cwd)+`:{"mcpServers":{}}}}`)
-	assertURL(t, Resolve(f.Env, claudeCodeReq("myserver", cwd)), "https://cwd-file.example.com/sse")
+	assertUnresolved(t, Resolve(f.Env, claudeCodeReq("myserver", cwd)), "more than one Claude Code MCP server could match")
 
-	// And with that silent too, the project file above it answers.
+	// Once only one declaration remains, it resolves normally.
 	f.write(filepath.Join(cwd, ".mcp.json"), `{"mcpServers":{}}`)
 	assertURL(t, Resolve(f.Env, claudeCodeReq("myserver", cwd)), "https://project-file.example.com/sse")
 }
 
 // TestClaudeCodeAncestorProjectFiles covers the project files above the working
-// directory. The agent reads every one from the working directory upwards and lets a
-// nearer file overwrite a farther one, so a server declared only higher up is still
-// live — reading the nearest file alone would report it as configured nowhere.
+// directory. The agent reads every one from the working directory upwards, so a
+// server declared only higher up is still live and repeated declarations are
+// ambiguous.
 func TestClaudeCodeAncestorProjectFiles(t *testing.T) {
 	f := newFixture(t, "darwin")
 	outer := f.mkdir(f.path("outer"))
@@ -198,7 +210,7 @@ func TestClaudeCodeAncestorProjectFiles(t *testing.T) {
 	}}`)
 
 	assertURL(t, Resolve(f.Env, claudeCodeReq("outeronly", inner)), "https://outer-only.example.com/sse")
-	assertURL(t, Resolve(f.Env, claudeCodeReq("shared", inner)), "https://inner-shared.example.com/sse")
+	assertUnresolved(t, Resolve(f.Env, claudeCodeReq("shared", inner)), "more than one Claude Code MCP server could match")
 }
 
 // TestClaudeCodeIgnoresAncestorProjectsEntry covers the anchor for the per-project
@@ -416,6 +428,38 @@ func TestClaudeAIConnectorDuplicateDisplayName(t *testing.T) {
 	}
 }
 
+func TestClaudeAIConnectorCollisionIsUnresolved(t *testing.T) {
+	f := newFixture(t, "darwin")
+	project := f.path("proj")
+	f.write(f.homePath(".claude.json"), `{
+		"claudeAiMcpEverConnected":["claude.ai My.Server","claude.ai My Server"]
+	}`)
+
+	res := Resolve(f.Env, claudeCodeReq("claude_ai_My_Server", project))
+	assertUnresolved(t, res, "more than one Claude Code MCP server could match")
+}
+
+func TestClaudeAIConnectorAndConfiguredServerCollisionIsUnresolved(t *testing.T) {
+	f := newFixture(t, "darwin")
+	project := f.path("proj")
+	f.write(f.homePath(".claude.json"), `{
+		"mcpServers":{"claude.ai MyServer":{"url":"https://configured.example.com/mcp"}},
+		"claudeAiMcpEverConnected":["claude.ai MyServer"]
+	}`)
+
+	res := Resolve(f.Env, claudeCodeReq("claude_ai_MyServer", project))
+	assertUnresolved(t, res, "more than one Claude Code MCP server could match")
+	var matches int
+	for _, step := range res.Trace {
+		if step.Matched {
+			matches++
+		}
+	}
+	if matches != 2 {
+		t.Fatalf("matched trace entries = %d, want 2\n%s", matches, resolveTrace(res))
+	}
+}
+
 // TestClaudeAIConnectorPrefixIsLoadBearing encodes both sides of the one mistake
 // that breaks every connector match. The claude_ai_ prefix in a reported name IS
 // the "claude.ai " in the stored display name, folded — so stripping it, which
@@ -470,6 +514,18 @@ func TestClaudeAIConnectorUnderManagedLockdown(t *testing.T) {
 	// nothing undecidable about a server that appears nowhere.
 	assertUnresolved(t, Resolve(f.Env, claudeCodeReq("claude_ai_Unknown", project)),
 		"managed MCP configuration, which cannot be overridden")
+}
+
+func TestClaudeAIConnectorCollidesWithManagedServer(t *testing.T) {
+	f := newFixture(t, "darwin")
+	project := f.path("proj")
+	f.write(f.homePath(".claude.json"),
+		`{"claudeAiMcpEverConnected":["claude.ai MyServer"]}`)
+	f.write(f.machinePath(claudeManagedMCPDarwin),
+		`{"mcpServers":{"claude.ai MyServer":{"url":"https://managed.example.com/sse"}}}`)
+
+	res := Resolve(f.Env, claudeCodeReq("claude_ai_MyServer", project))
+	assertUnresolved(t, res, "more than one Claude Code MCP server could match")
 }
 
 // projectKeysJSON renders a ~/.claude.json projects{} block with an empty servers
@@ -540,11 +596,10 @@ func TestAncestorsIsBounded(t *testing.T) {
 	}
 }
 
-// TestClaudeCodeScopesRankOrder pins the ordering contract: the working directory's
-// own entry in the user config, then the project files nearest first, then the
-// user-wide table. Ranks are consecutive, since every one of these is a singleton
-// and position is the whole of precedence.
-func TestClaudeCodeScopesRankOrder(t *testing.T) {
+// TestClaudeCodeScopesOrder pins the diagnostic order: the working directory's own
+// entry in the user config, then the project files nearest first, then the user-wide
+// table. This order does not select a winner when more than one source matches.
+func TestClaudeCodeScopesOrder(t *testing.T) {
 	f := newFixture(t, "darwin")
 	project := f.mkdir(f.path("proj"))
 	cwd := f.mkdir(filepath.Join(project, "a", "b"))
@@ -566,16 +621,11 @@ func TestClaudeCodeScopesRankOrder(t *testing.T) {
 	if got := scopeKeys(scopes); !slices.Equal(got, want) {
 		t.Fatalf("scopes\n%v\nwant\n%v", got, want)
 	}
-	for i, s := range scopes {
-		if s.rank != i+1 {
-			t.Fatalf("scope %d has rank %d, want %d: ranks must be consecutive", i, s.rank, i+1)
-		}
-	}
 }
 
 // TestClaudeCodeScopesTakesEveryProjectFile covers the project walk: every project
 // file from the working directory upwards is a scope, nearest first, because the
-// agent reads them all and lets a nearer one overwrite a farther one.
+// agent reads them all.
 func TestClaudeCodeScopesTakesEveryProjectFile(t *testing.T) {
 	f := newFixture(t, "darwin")
 	outer := f.mkdir(f.path("outer"))
