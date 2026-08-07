@@ -612,6 +612,9 @@ func skillsDirPluginInstalls(ctx context.Context, loader *configLoader, env Env,
 	}
 	seen := make(map[string]struct{}, len(roots))
 	for _, root := range roots {
+		if ctx.Err() != nil {
+			return out, nil
+		}
 		if _, ok := seen[root]; ok {
 			continue
 		}
