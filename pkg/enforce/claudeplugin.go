@@ -1,12 +1,10 @@
 package enforce
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"io/fs"
 	"maps"
 	"os"
@@ -14,8 +12,6 @@ import (
 	"slices"
 	"strings"
 	"syscall"
-
-	"gopkg.in/yaml.v3"
 )
 
 // Claude Code plugins declare MCP servers of their own, and a call to one arrives
@@ -43,8 +39,12 @@ const (
 	// It is the only registry file there is: its contents carry their own version, so
 	// this one name covers every layout the agent reads.
 	claudeInstalledPluginsFile = "installed_plugins.json"
-	// claudeSkillDoc is the document describing a skill directory.
-	claudeSkillDoc = "SKILL.md"
+	// claudeKnownMarketplacesFile indexes the marketplaces plugins come from, relative
+	// to the plugin tree.
+	claudeKnownMarketplacesFile = "known_marketplaces.json"
+	// claudeMarketplaceManifestSub is a marketplace's own manifest, relative to where
+	// it is installed.
+	claudeMarketplaceManifestSub = ".claude-plugin/marketplace.json"
 )
 
 // Bounds on plugin discovery.
@@ -52,16 +52,7 @@ const (
 	maxPluginInstalls        = 256
 	maxSkillDirEntries       = 512
 	maxPluginManifestSources = 8
-	maxSkillDocBytes         = 1 << 20
 )
-
-// claudeSkillManifestKeys are the frontmatter keys that make a skill directory a
-// plugin as well. A directory declaring none of them contributes nothing, however
-// else it is furnished.
-var claudeSkillManifestKeys = [...]string{
-	"mcpServers", "lspServers", "agents", "outputStyles", "themes", "workflows",
-	"channels", "monitors", "settings", "userConfig", "experimental",
-}
 
 // pluginGap is a plugin source the resolver knows is there and could not enumerate:
 // a directory it could not list, a bound it ran into, a registry it could not read.
@@ -138,6 +129,105 @@ func pluginInstallRecords(env Env, id string, raw json.RawMessage) []pluginInsta
 		return records
 	}
 	return nil
+}
+
+// claudeMarketplaces is the part of the marketplace index the resolver reads: for
+// each marketplace, where it is served from and where it lives on this machine.
+type claudeMarketplaces map[string]struct {
+	Source struct {
+		Source string `json:"source"`
+	} `json:"source"`
+	InstallLocation string `json:"installLocation"`
+}
+
+// servedInPlace reports whether a marketplace is a directory on this machine rather
+// than something fetched from elsewhere. That distinction decides where the plugins
+// under it are read from — see marketplacePluginRoot.
+func (m claudeMarketplaces) servedInPlace(name string) (string, bool) {
+	entry, ok := m[name]
+	if !ok {
+		return "", false
+	}
+	switch entry.Source.Source {
+	case "file", "directory":
+		return strings.TrimSpace(entry.InstallLocation), true
+	}
+	return "", false
+}
+
+// loadMarketplaces reads the index of the marketplaces installed on this machine.
+//
+// An index that is absent records no marketplace at all. Nothing is then served in
+// place, so every plugin is read from the location its own registry entry names, and
+// there is nothing here to resolve. That is the ordinary case, and not a gap.
+//
+// An index that exists and cannot be read is a gap, for the reason an unreadable
+// plugin registry is one: it declares no servers itself, it decides which files do.
+// Without it there is no telling whether a plugin is read from its marketplace or
+// from the copy the registry recorded — two different files, which can declare two
+// different servers.
+func loadMarketplaces(ctx context.Context, loader *configLoader, env Env) (claudeMarketplaces, *pluginGap) {
+	var markets claudeMarketplaces
+	path := filepath.Join(env.claudePluginsDir(), claudeKnownMarketplacesFile)
+	switch loader.loadJSON(ctx, path, &markets) {
+	case loadUnusable:
+		return nil, &pluginGap{path: path, key: "marketplaces", detail: fmt.Sprintf(
+			"the marketplace index at %s could not be read", path)}
+	case loadAbsent:
+		return nil, nil
+	}
+	return markets, nil
+}
+
+// marketplacePluginRoot returns the directory a plugin's own files are read from when
+// its marketplace is served in place, and empty when the registry's recorded location
+// governs instead.
+//
+// The marketplace names each plugin's directory relative to its own, so that entry is
+// what locates the plugin — the plugin's name is only the key to look it up by. An
+// index that names a location which is itself a file is read relative to the
+// directory holding it.
+func marketplacePluginRoot(ctx context.Context, loader *configLoader, markets claudeMarketplaces, name, marketplace string) (string, *pluginGap) {
+	base, ok := markets.servedInPlace(marketplace)
+	if !ok || base == "" || !filepath.IsAbs(base) {
+		return "", nil
+	}
+	if info, err := os.Lstat(base); err == nil && !info.IsDir() {
+		base = filepath.Dir(base)
+	}
+
+	var manifest struct {
+		Plugins []struct {
+			Name   string          `json:"name"`
+			Source json.RawMessage `json:"source"`
+		} `json:"plugins"`
+	}
+	path := filepath.Join(base, filepath.FromSlash(claudeMarketplaceManifestSub))
+	if res := loader.loadJSON(ctx, path, &manifest); res != loadOK {
+		if res == loadUnusable {
+			return "", &pluginGap{path: path, key: "plugins", detail: fmt.Sprintf(
+				"the marketplace at %s could not be read", path)}
+		}
+		return "", nil
+	}
+
+	for _, entry := range manifest.Plugins {
+		if entry.Name != name {
+			continue
+		}
+		// Only a plugin named as a path under the marketplace is read in place. One
+		// carrying a source of its own is fetched like any other, so the registry's
+		// recorded location governs it.
+		var rel string
+		if jsonKindOf(entry.Source) != '"' || json.Unmarshal(entry.Source, &rel) != nil {
+			return "", nil
+		}
+		if rel = strings.TrimSpace(rel); rel == "" || filepath.IsAbs(rel) {
+			return "", nil
+		}
+		return filepath.Join(base, filepath.FromSlash(rel)), nil
+	}
+	return "", nil
 }
 
 // pluginCachePaths returns the locations the older registry shape implies a plugin
@@ -411,7 +501,7 @@ func (l *configLoader) claudePluginInstalls(ctx context.Context, env Env, cwd st
 		return cached.installs, cached.gap
 	}
 	installs, gap := registryPluginInstalls(ctx, l, env, cwd, make([]pluginInstall, 0, 8))
-	installs, skillsGap := skillsDirPluginInstalls(env, cwd, installs)
+	installs, skillsGap := skillsDirPluginInstalls(ctx, l, env, cwd, installs)
 	gap = firstGap(gap, skillsGap)
 	if ctx.Err() != nil {
 		return nil, nil
@@ -444,6 +534,11 @@ func registryPluginInstalls(ctx context.Context, loader *configLoader, env Env, 
 		return out, nil
 	}
 
+	markets, gap := loadMarketplaces(ctx, loader, env)
+	if gap != nil {
+		return out, gap
+	}
+
 	dirs := ancestors(cwd)
 	projectDirs := make(map[string]struct{}, len(dirs))
 	for _, dir := range dirs {
@@ -454,12 +549,24 @@ func registryPluginInstalls(ctx context.Context, loader *configLoader, env Env, 
 	// Sorted, so a registry that overruns the bound drops the same installations on
 	// every run rather than whichever ones map order happened to reach last.
 	for _, key := range slices.Sorted(maps.Keys(reg.Plugins)) {
-		name, _, _ := strings.Cut(key, "@")
+		name, marketplace, _ := strings.Cut(key, "@")
 		if name == "" {
 			continue
 		}
+		// A marketplace already on this machine is used where it sits, and the
+		// location the registry records for the plugin is not consulted at all. That
+		// location may be an absent or stale copy of a directory somebody is editing
+		// in place, so preferring it would read a file the agent never opens.
+		inPlace, marketGap := marketplacePluginRoot(ctx, loader, markets, name, marketplace)
+		if marketGap != nil {
+			return out, marketGap
+		}
+
 		for _, install := range pluginInstallRecords(env, key, reg.Plugins[key]) {
 			root := strings.TrimSpace(install.InstallPath)
+			if inPlace != "" {
+				root = inPlace
+			}
 			if root == "" || !filepath.IsAbs(root) {
 				continue
 			}
@@ -487,13 +594,15 @@ func registryPluginInstalls(ctx context.Context, loader *configLoader, env Env, 
 // skillsDirPluginInstalls appends the pseudo-plugins Claude Code synthesizes from
 // skill directories. They appear in no registry — the agent builds one per
 // qualifying directory under the global and project skills roots, named for the
-// directory — and they carry no manifest, so a .mcp.json in the directory is all
-// there is to read.
+// directory it found rather than for anything the directory calls itself.
 //
-// A directory qualifies only when its skill document declares at least one plugin
-// manifest key. A skill that is only a skill never becomes a plugin, so treating one
-// as a plugin would let a server file that never loads answer for a call.
-func skillsDirPluginInstalls(env Env, cwd string, out []pluginInstall) ([]pluginInstall, *pluginGap) {
+// A directory qualifies on one thing: carrying a plugin manifest. Without one it is
+// a skill and nothing more, whatever else it holds, so treating it as a plugin would
+// let a server file that never loads answer for a call.
+//
+// These carry that manifest like any other plugin, so what it declares is read the
+// same way — see pluginManifestScopes.
+func skillsDirPluginInstalls(ctx context.Context, loader *configLoader, env Env, cwd string, out []pluginInstall) ([]pluginInstall, *pluginGap) {
 	roots := []string{env.claudeSkillsDir()}
 	// The project root is the working directory's own, with no walk above it: the
 	// agent looks where it was launched and nowhere else. See projectsKey on why that
@@ -529,7 +638,7 @@ func skillsDirPluginInstalls(env Env, cwd string, out []pluginInstall) ([]plugin
 				continue
 			}
 			dir := filepath.Join(root, entry.Name())
-			if !skillDirDeclaresPlugin(dir) {
+			if !dirDeclaresPlugin(ctx, loader, dir) {
 				continue
 			}
 			if len(out) == maxPluginInstalls {
@@ -542,54 +651,17 @@ func skillsDirPluginInstalls(env Env, cwd string, out []pluginInstall) ([]plugin
 	return out, nil
 }
 
-// skillDirDeclaresPlugin reports whether a skill directory declares a plugin as
-// well, which is what makes its server file live.
-func skillDirDeclaresPlugin(dir string) bool {
-	front, ok := skillFrontmatter(filepath.Join(dir, claudeSkillDoc))
-	if !ok {
-		return false
+// dirDeclaresPlugin reports whether a directory carries a plugin manifest, which is
+// what makes the servers under it live.
+//
+// The manifest has to parse as an object, not merely exist: a malformed one leaves
+// the agent with no plugin at all rather than a plugin with nothing in it.
+func dirDeclaresPlugin(ctx context.Context, loader *configLoader, dir string) bool {
+	var manifest struct {
+		Name string `json:"name"`
 	}
-	for _, key := range claudeSkillManifestKeys {
-		// A key that is present but empty declares nothing, same as one left out.
-		if value, present := front[key]; present && value != nil {
-			return true
-		}
-	}
-	return false
-}
-
-// skillFrontmatter decodes the leading YAML block of a skill document. A document
-// that is missing, unreadable, oversized, or carrying no parsable block declares
-// nothing.
-func skillFrontmatter(path string) (map[string]any, bool) {
-	f, err := openConfigFile(path)
-	if err != nil {
-		return nil, false
-	}
-	defer func() { _ = f.Close() }()
-
-	info, err := f.Stat()
-	if err != nil || !info.Mode().IsRegular() || info.Size() > maxSkillDocBytes {
-		return nil, false
-	}
-	data, err := io.ReadAll(io.LimitReader(f, maxSkillDocBytes))
-	if err != nil {
-		return nil, false
-	}
-
-	doc := strings.TrimLeft(string(bytes.TrimPrefix(data, utf8BOM)), " \t\r\n")
-	if !strings.HasPrefix(doc, "---") {
-		return nil, false
-	}
-	block, _, found := strings.Cut(strings.TrimLeft(doc[3:], "\r\n"), "\n---")
-	if !found {
-		return nil, false
-	}
-	var front map[string]any
-	if err := yaml.Unmarshal([]byte(block), &front); err != nil || front == nil {
-		return nil, false
-	}
-	return front, true
+	path := filepath.Join(dir, filepath.FromSlash(claudePluginManifestSub))
+	return loader.loadJSON(ctx, path, &manifest) == loadOK
 }
 
 func isNotDirectory(err error) bool {

@@ -24,14 +24,14 @@ func (f *fixture) installPlugin(key string) string {
 	return root
 }
 
-// installSkillPlugin writes a skill directory that also declares a plugin: the
-// document whose frontmatter carries a manifest key, which is what makes it one, and
-// the server file that is then read from it.
+// installSkillPlugin writes a skills-root directory that also declares a plugin: the
+// manifest, which is what makes it one, and the server file that is then read from
+// it.
 func (f *fixture) installSkillPlugin(dir, servers string) string {
 	f.t.Helper()
 	f.mkdir(dir)
-	f.write(filepath.Join(dir, claudeSkillDoc),
-		"---\nname: "+filepath.Base(dir)+"\nmcpServers: {}\n---\n\nbody\n")
+	f.write(filepath.Join(dir, filepath.FromSlash(claudePluginManifestSub)),
+		`{"name":"`+filepath.Base(dir)+`","version":"1.0.0"}`)
 	f.write(filepath.Join(dir, claudePluginMCPFile), servers)
 	return dir
 }
@@ -302,44 +302,67 @@ func TestClaudeCodePluginSkillsDirIsNotWalkedUpwards(t *testing.T) {
 	assertUnresolved(t, Resolve(f.Env, claudeCodeReq("plugin_deploy_deploy", deep)), "was not found")
 }
 
-// TestClaudeCodePluginSkillsDirNeedsAManifestKey covers the gate on a skill
-// directory. A skill that is only a skill never becomes a plugin, however it is
-// furnished, so its server file is never read — treating one as a plugin would let a
-// file that never loads answer for a call.
-func TestClaudeCodePluginSkillsDirNeedsAManifestKey(t *testing.T) {
+// TestClaudeCodePluginSkillsDirNeedsAManifest covers the gate on a directory under a
+// skills root. Carrying a plugin manifest is the whole of it: without one the
+// directory is a skill and nothing more, and its server file is never read —
+// treating it as a plugin would let a file that never loads answer for a call.
+func TestClaudeCodePluginSkillsDirNeedsAManifest(t *testing.T) {
 	const servers = `{"notes":{"url":"https://skill.example.com/mcp"}}`
+	manifestRel := filepath.FromSlash(claudePluginManifestSub)
 
-	// skillDir builds a skill directory carrying a server file and the given document.
-	skillDir := func(t *testing.T, doc string) *fixture {
+	// skillDir builds a directory under the skills root carrying a server file, plus
+	// whatever manifest content is given — an empty string writes no manifest at all.
+	skillDir := func(t *testing.T, manifest string) *fixture {
 		t.Helper()
 		f := newFixture(t, "darwin")
 		dir := f.mkdir(f.homePath(".claude", "skills", "notes"))
 		f.write(filepath.Join(dir, claudePluginMCPFile), servers)
-		if doc != "" {
-			f.write(filepath.Join(dir, claudeSkillDoc), doc)
+		f.write(filepath.Join(dir, "SKILL.md"), "---\nname: notes\nmcpServers: {}\n---\n\nbody\n")
+		if manifest != "" {
+			f.write(filepath.Join(dir, manifestRel), manifest)
 		}
 		return f
 	}
 
-	for name, doc := range map[string]string{
-		"no skill document":     "",
-		"no frontmatter":        "just a body\n",
-		"unterminated block":    "---\nname: notes\nmcpServers: {}\n",
-		"no manifest key":       "---\nname: notes\ndescription: just a skill\n---\n\nbody\n",
-		"key present but empty": "---\nname: notes\nmcpServers:\n---\n\nbody\n",
+	// A skill document declaring servers does not stand in for the manifest.
+	for name, manifest := range map[string]string{
+		"no manifest":        "",
+		"malformed manifest": `{"name":`,
+		"manifest is a list": `[]`,
 	} {
 		t.Run(name, func(t *testing.T) {
-			f := skillDir(t, doc)
+			f := skillDir(t, manifest)
 			assertUnresolved(t, Resolve(f.Env, claudeCodeReq("plugin_notes_notes", f.path("proj"))),
 				"was not found")
 		})
 	}
 
-	// Any one of the manifest keys is enough; it does not have to be the server one.
-	t.Run("another manifest key entirely", func(t *testing.T) {
-		f := skillDir(t, "---\nname: notes\nagents: [reviewer]\n---\n\nbody\n")
+	t.Run("manifest present", func(t *testing.T) {
+		f := skillDir(t, `{"name":"notes","version":"1.0.0"}`)
 		assertURL(t, Resolve(f.Env, claudeCodeReq("plugin_notes_notes", f.path("proj"))),
 			"https://skill.example.com/mcp")
+	})
+
+	// And with no skill document anywhere, the manifest alone still makes it one.
+	t.Run("manifest without a skill document", func(t *testing.T) {
+		f := newFixture(t, "darwin")
+		dir := f.mkdir(f.homePath(".claude", "skills", "notes"))
+		f.write(filepath.Join(dir, claudePluginMCPFile), servers)
+		f.write(filepath.Join(dir, manifestRel), `{"name":"notes","version":"1.0.0"}`)
+		assertURL(t, Resolve(f.Env, claudeCodeReq("plugin_notes_notes", f.path("proj"))),
+			"https://skill.example.com/mcp")
+	})
+
+	// A skills-root plugin's manifest is read like any other plugin's, so servers it
+	// declares itself are live and outrank the directory's own file.
+	t.Run("manifest declares servers", func(t *testing.T) {
+		f := newFixture(t, "darwin")
+		dir := f.mkdir(f.homePath(".claude", "skills", "notes"))
+		f.write(filepath.Join(dir, claudePluginMCPFile), servers)
+		f.write(filepath.Join(dir, manifestRel),
+			`{"name":"notes","mcpServers":{"notes":{"url":"https://manifest.example.com/mcp"}}}`)
+		assertURL(t, Resolve(f.Env, claudeCodeReq("plugin_notes_notes", f.path("proj"))),
+			"https://manifest.example.com/mcp")
 	})
 }
 
@@ -366,6 +389,84 @@ func TestClaudeCodePluginProjectScopeInstallIgnoredElsewhere(t *testing.T) {
 
 	// From inside the project that owns it, it answers.
 	assertURL(t, Resolve(f.Env, claudeCodeReq("plugin_acme_tools", theirs)), "https://theirs.example.com/mcp")
+}
+
+// installMarketplace writes a marketplace index entry and manifest, and returns the
+// marketplace directory. source is the index's source object, which decides whether
+// the marketplace is served where it sits or fetched from elsewhere.
+func (f *fixture) installMarketplace(name, source string, entries ...string) string {
+	f.t.Helper()
+	dir := f.mkdir(f.homePath(".claude", "plugins", "marketplaces", name))
+	f.write(filepath.Join(dir, filepath.FromSlash(claudeMarketplaceManifestSub)), fmt.Sprintf(
+		`{"name":%s,"plugins":[%s]}`, quote(name), strings.Join(entries, ",")))
+	f.write(f.homePath(".claude", "plugins", claudeKnownMarketplacesFile), fmt.Sprintf(
+		`{%s:{"source":%s,"installLocation":%s}}`, quote(name), source, quote(dir)))
+	return dir
+}
+
+// TestClaudeCodePluginMarketplaceServedInPlace covers a marketplace that is already a
+// directory on this machine. Its plugins are read where they sit, and the location
+// the registry records for them is not consulted at all — that copy can be absent, or
+// a stale image of a directory somebody is editing in place, so reading it would
+// answer for a call with a file the agent never opened.
+func TestClaudeCodePluginMarketplaceServedInPlace(t *testing.T) {
+	f := newFixture(t, "darwin")
+	market := f.installMarketplace("market", `{"source":"directory","path":"/somewhere"}`,
+		`{"name":"acme","source":"./acme"}`)
+	inPlace := f.mkdir(filepath.Join(market, "acme"))
+	f.write(filepath.Join(inPlace, claudePluginMCPFile),
+		`{"tools":{"url":"https://in-place.example.com/mcp"}}`)
+
+	// The registry records a copy declaring something else entirely.
+	cached := f.mkdir(f.homePath(".claude", "plugins", "cache", "market", "acme", "1.0.0"))
+	f.write(filepath.Join(cached, claudePluginMCPFile),
+		`{"tools":{"url":"https://recorded.example.com/mcp"}}`)
+	f.write(f.homePath(".claude", "plugins", claudeInstalledPluginsFile), fmt.Sprintf(
+		`{"version":2,"plugins":{"acme@market":[{"scope":"user","installPath":%s}]}}`, quote(cached)))
+
+	res := Resolve(f.Env, claudeCodeReq("plugin_acme_tools", f.path("proj")))
+	assertURL(t, res, "https://in-place.example.com/mcp")
+	for _, step := range res.Trace {
+		if strings.HasPrefix(step.Path, cached) {
+			t.Fatalf("read the recorded copy instead of the marketplace:\n%s", resolveTrace(res))
+		}
+	}
+}
+
+// TestClaudeCodePluginMarketplaceFetched covers the other half: a marketplace fetched
+// from somewhere else is copied into the plugin tree, so the location the registry
+// records is the live one and the marketplace's own copy is not read.
+func TestClaudeCodePluginMarketplaceFetched(t *testing.T) {
+	f := newFixture(t, "darwin")
+	market := f.installMarketplace("market", `{"source":"github","repo":"acme/plugins"}`,
+		`{"name":"acme","source":"./acme"}`)
+	f.write(filepath.Join(f.mkdir(filepath.Join(market, "acme")), claudePluginMCPFile),
+		`{"tools":{"url":"https://in-place.example.com/mcp"}}`)
+
+	cached := f.mkdir(f.homePath(".claude", "plugins", "cache", "market", "acme", "1.0.0"))
+	f.write(filepath.Join(cached, claudePluginMCPFile),
+		`{"tools":{"url":"https://recorded.example.com/mcp"}}`)
+	f.write(f.homePath(".claude", "plugins", claudeInstalledPluginsFile), fmt.Sprintf(
+		`{"version":2,"plugins":{"acme@market":[{"scope":"user","installPath":%s}]}}`, quote(cached)))
+
+	assertURL(t, Resolve(f.Env, claudeCodeReq("plugin_acme_tools", f.path("proj"))),
+		"https://recorded.example.com/mcp")
+}
+
+// TestClaudeCodePluginMarketplaceIndexIsAnIndex covers the marketplace index against
+// the same rule the plugin registry answers to: it is not a source of servers but an
+// index deciding which files are, so one that exists and cannot be read hides the
+// question rather than one answer to it.
+func TestClaudeCodePluginMarketplaceIndexIsAnIndex(t *testing.T) {
+	f := newFixture(t, "darwin")
+	root := f.installPlugin("acme@market")
+	f.write(filepath.Join(root, claudePluginMCPFile), `{"tools":{"url":"https://plugin.example.com/mcp"}}`)
+	assertURL(t, Resolve(f.Env, claudeCodeReq("plugin_acme_tools", f.path("proj"))),
+		"https://plugin.example.com/mcp")
+
+	f.write(f.homePath(".claude", "plugins", claudeKnownMarketplacesFile), `{"market":`)
+	assertUnresolved(t, Resolve(f.Env, claudeCodeReq("plugin_acme_tools", f.path("proj"))),
+		"the marketplace index at")
 }
 
 // TestClaudeCodePluginRegistryOlderShape covers the older registry layout, which
